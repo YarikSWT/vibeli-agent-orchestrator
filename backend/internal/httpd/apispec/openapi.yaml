@@ -7455,9 +7455,13 @@ components:
           type: string
         enabled:
           type: boolean
+        projectId:
+          type: string
         provider:
           enum:
           - github
+          type: string
+        readyStatus:
           type: string
         repo:
           type: string

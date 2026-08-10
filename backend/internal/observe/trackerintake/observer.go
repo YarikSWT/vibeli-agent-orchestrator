@@ -42,10 +42,11 @@ type Spawner interface {
 	Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Session, int, int, error)
 }
 
-// TrackerResolver picks the tracker adapter for a project's configured
-// provider.
+// TrackerResolver picks the tracker adapter for a project's intake config. It
+// takes the whole config, not just the provider, because a board-backed
+// provider is only addressable together with its board id and ready column.
 type TrackerResolver interface {
-	Resolve(provider domain.TrackerProvider) (ports.Tracker, error)
+	Resolve(cfg domain.TrackerIntakeConfig) (ports.Tracker, error)
 }
 
 // SingleTrackerResolver returns the same tracker for one specific provider and
@@ -58,7 +59,8 @@ type SingleTrackerResolver struct {
 
 // Resolve returns the wrapped adapter when the requested provider matches, or
 // when the resolver was constructed without a provider pin.
-func (s SingleTrackerResolver) Resolve(provider domain.TrackerProvider) (ports.Tracker, error) {
+func (s SingleTrackerResolver) Resolve(cfg domain.TrackerIntakeConfig) (ports.Tracker, error) {
+	provider := cfg.Provider
 	if s.Adapter == nil {
 		return nil, fmt.Errorf("tracker intake: no adapter for provider %q", provider)
 	}
@@ -175,7 +177,7 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		o.logger.Warn("tracker intake: skipping project without tracker scope", "project", project.ID, "provider", cfg.Provider, "origin", project.RepoOriginURL)
 		return true
 	}
-	tracker, err := o.resolver.Resolve(cfg.Provider)
+	tracker, err := o.resolver.Resolve(cfg)
 	if err != nil {
 		o.logger.Warn("tracker intake: no adapter for provider", "project", project.ID, "provider", cfg.Provider, "err", err)
 		return true

@@ -372,19 +372,23 @@ func TestStartTrackerIntake_RunsEvenWithoutEnabledProjects(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := startTrackerIntake(ctx, store, svc, log)
+	done, syncDone := startTrackerIntake(ctx, store, svc, log)
 
-	select {
-	case <-done:
-		t.Fatal("startTrackerIntake returned an already-closed channel; observer loop did not start")
-	case <-time.After(20 * time.Millisecond):
+	for name, ch := range map[string]<-chan struct{}{"intake": done, "project sync": syncDone} {
+		select {
+		case <-ch:
+			t.Fatalf("startTrackerIntake returned an already-closed %s channel; observer loop did not start", name)
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("observer did not stop after context cancellation")
+	for name, ch := range map[string]<-chan struct{}{"intake": done, "project sync": syncDone} {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s observer did not stop after context cancellation", name)
+		}
 	}
 }
 

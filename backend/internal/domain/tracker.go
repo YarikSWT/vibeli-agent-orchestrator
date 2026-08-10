@@ -8,8 +8,20 @@ import (
 // TrackerProvider identifies an issue-tracker provider implementation.
 type TrackerProvider string
 
-// TrackerProviderGitHub is the only supported issue-tracker provider.
-const TrackerProviderGitHub TrackerProvider = "github"
+// The supported issue-tracker providers.
+const (
+	// TrackerProviderGitHub reads the repository's issue list.
+	TrackerProviderGitHub TrackerProvider = "github"
+	// TrackerProviderGitHubProjects reads a GitHub Projects v2 board: the
+	// queue is a Status column, not the issue list. Issue ids stay in
+	// GitHub's native "owner/repo#123" form, so everything downstream of
+	// intake (PR linking, Get, session metadata) is unchanged.
+	TrackerProviderGitHubProjects TrackerProvider = "github-projects"
+)
+
+// DefaultProjectReadyStatus is the Status column intake claims cards from when
+// a project config does not name one.
+const DefaultProjectReadyStatus = "Ready"
 
 // TrackerID identifies one issue. Native is the provider's own canonical form
 // ("owner/repo#123" for GitHub) and is parsed by the adapter.
@@ -91,6 +103,14 @@ type TrackerIntakeConfig struct {
 	// Assignee narrows eligible issues to one assignee. Provider-specific values
 	// such as "*" are passed through unchanged.
 	Assignee string `json:"assignee,omitempty"`
+	// ProjectID is the Projects v2 board node id ("PVT_..."). Required by the
+	// github-projects provider and ignored by github. A node id is used rather
+	// than owner+number because it resolves identically for user- and
+	// organization-owned boards.
+	ProjectID string `json:"projectId,omitempty"`
+	// ReadyStatus is the Status column intake claims cards from. Empty means
+	// DefaultProjectReadyStatus. github-projects only.
+	ReadyStatus string `json:"readyStatus,omitempty"`
 }
 
 // WithDefaults fills the provider only when intake is enabled. Disabled intake
@@ -98,6 +118,9 @@ type TrackerIntakeConfig struct {
 func (c TrackerIntakeConfig) WithDefaults() TrackerIntakeConfig {
 	if c.Enabled && c.Provider == "" {
 		c.Provider = TrackerProviderGitHub
+	}
+	if c.Enabled && c.Provider == TrackerProviderGitHubProjects && strings.TrimSpace(c.ReadyStatus) == "" {
+		c.ReadyStatus = DefaultProjectReadyStatus
 	}
 	return c
 }
@@ -108,7 +131,7 @@ func (c TrackerIntakeConfig) Validate() error {
 		return nil
 	}
 	c = c.WithDefaults()
-	if c.Enabled && c.Provider != TrackerProviderGitHub {
+	if c.Provider != TrackerProviderGitHub && c.Provider != TrackerProviderGitHubProjects {
 		return fmt.Errorf("trackerIntake.provider: unsupported provider %q", c.Provider)
 	}
 	if err := validateNoWhitespaceField("trackerIntake.repo", c.Repo); err != nil {
@@ -117,6 +140,27 @@ func (c TrackerIntakeConfig) Validate() error {
 	if err := validateNoWhitespaceField("trackerIntake.assignee", c.Assignee); err != nil {
 		return err
 	}
+	if err := validateNoWhitespaceField("trackerIntake.projectId", c.ProjectID); err != nil {
+		return err
+	}
+	if c.Provider == TrackerProviderGitHubProjects {
+		// The board column is the eligibility rule here, so an assignee is not
+		// required — but the board itself must be named, otherwise there is
+		// nothing to poll.
+		if strings.TrimSpace(c.ProjectID) == "" {
+			return fmt.Errorf("trackerIntake: projectId is required for provider %q", c.Provider)
+		}
+		return nil
+	}
+	if strings.TrimSpace(c.ProjectID) != "" {
+		return fmt.Errorf("trackerIntake.projectId: only supported by provider %q", TrackerProviderGitHubProjects)
+	}
+	if strings.TrimSpace(c.ReadyStatus) != "" {
+		return fmt.Errorf("trackerIntake.readyStatus: only supported by provider %q", TrackerProviderGitHubProjects)
+	}
+	// Plain issue-list intake has no column to narrow on, so an explicit
+	// assignee rule is the only thing standing between intake and draining the
+	// whole backlog.
 	if strings.TrimSpace(c.Assignee) == "" {
 		return fmt.Errorf("trackerIntake: assignee is required when enabled")
 	}
