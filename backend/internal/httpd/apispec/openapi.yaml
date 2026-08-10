@@ -7455,11 +7455,14 @@ components:
           type: string
         enabled:
           type: boolean
+        maxConcurrent:
+          type: integer
         projectId:
           type: string
         provider:
           enum:
           - github
+          - github-projects
           type: string
         readyStatus:
           type: string

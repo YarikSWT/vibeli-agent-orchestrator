@@ -144,6 +144,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	seen := seenIssueIDs(sessions)
+	live := liveIntakeSessions(sessions)
 	for _, project := range enabledProjects {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -152,7 +153,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 			o.logger.Debug("tracker intake: project in failure backoff", "project", project.ID, "until", until)
 			continue
 		}
-		if failed := o.pollProject(ctx, project, seen); failed {
+		if failed := o.pollProject(ctx, project, seen, live); failed {
 			o.backoffUntil[project.ID] = now.Add(o.failureBackoff)
 		} else {
 			delete(o.backoffUntil, project.ID)
@@ -163,7 +164,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 
 // pollProject returns failed=true for conditions that should be retried after a
 // backoff window rather than logged on every poll.
-func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord, seen map[domain.IssueID]bool) (failed bool) {
+func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord, seen map[domain.IssueID]bool, live map[domain.ProjectID]int) (failed bool) {
 	cfg := project.Config.TrackerIntake.WithDefaults()
 	if !cfg.Enabled {
 		return false
@@ -190,8 +191,24 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		o.logger.Error("tracker intake: list issues failed", "project", project.ID, "repo", repo.Native, "err", err)
 		return true
 	}
+	// MaxConcurrent throttles a triaged backlog against the agent provider's
+	// rate limits: without it, a board with a full ready column spawns one
+	// session per card on the first tick.
+	projectID := domain.ProjectID(project.ID)
+	budget := -1
+	if cfg.MaxConcurrent > 0 {
+		budget = cfg.MaxConcurrent - live[projectID]
+		if budget <= 0 {
+			o.logger.Debug("tracker intake: project at its concurrency cap", "project", project.ID, "live", live[projectID], "max", cfg.MaxConcurrent)
+			return false
+		}
+	}
 	var spawnFailed bool
 	for _, issue := range issues {
+		if budget == 0 {
+			o.logger.Info("tracker intake: concurrency cap reached, remaining cards stay queued", "project", project.ID, "max", cfg.MaxConcurrent)
+			break
+		}
 		if ctx.Err() != nil {
 			return true
 		}
@@ -206,7 +223,7 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 			continue
 		}
 		if _, _, _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
-			ProjectID: domain.ProjectID(project.ID),
+			ProjectID: projectID,
 			IssueID:   issueID,
 			Kind:      domain.KindWorker,
 			Prompt:    BuildIssuePrompt(issue),
@@ -216,8 +233,25 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 			continue
 		}
 		seen[issueID] = true
+		live[projectID]++
+		if budget > 0 {
+			budget--
+		}
 	}
 	return spawnFailed
+}
+
+// liveIntakeSessions counts the sessions that still occupy a concurrency slot:
+// started from an issue and not yet terminated.
+func liveIntakeSessions(sessions []domain.SessionRecord) map[domain.ProjectID]int {
+	live := map[domain.ProjectID]int{}
+	for _, session := range sessions {
+		if session.IsTerminated || session.IssueID == "" {
+			continue
+		}
+		live[session.ProjectID]++
+	}
+	return live
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {

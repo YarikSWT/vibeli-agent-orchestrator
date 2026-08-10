@@ -88,12 +88,13 @@ type roleOverride struct {
 
 // trackerIntakeConfig mirrors domain.TrackerIntakeConfig.
 type trackerIntakeConfig struct {
-	Enabled     bool   `json:"enabled,omitempty"`
-	Provider    string `json:"provider,omitempty"`
-	Repo        string `json:"repo,omitempty"`
-	Assignee    string `json:"assignee,omitempty"`
-	ProjectID   string `json:"projectId,omitempty"`
-	ReadyStatus string `json:"readyStatus,omitempty"`
+	Enabled       bool   `json:"enabled,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	Repo          string `json:"repo,omitempty"`
+	Assignee      string `json:"assignee,omitempty"`
+	ProjectID     string `json:"projectId,omitempty"`
+	ReadyStatus   string `json:"readyStatus,omitempty"`
+	MaxConcurrent int    `json:"maxConcurrent,omitempty"`
 }
 
 // projectConfig mirrors the daemon's typed domain.ProjectConfig for the CLI
@@ -121,26 +122,27 @@ type setConfigRequest struct {
 }
 
 type projectSetConfigOptions struct {
-	defaultBranch      string
-	sessionPrefix      string
-	model              string
-	permission         string
-	workerAgent        string
-	orchestratorAgent  string
-	agentRules         string
-	agentRulesFile     string
-	orchestratorRules  string
-	env                []string
-	symlink            []string
-	postCreate         []string
-	trackerIntake      bool
-	trackerRepo        string
-	trackerAssignee    string
-	trackerProjectID   string
-	trackerReadyStatus string
-	configJSON         string
-	clear              bool
-	json               bool
+	defaultBranch        string
+	sessionPrefix        string
+	model                string
+	permission           string
+	workerAgent          string
+	orchestratorAgent    string
+	agentRules           string
+	agentRulesFile       string
+	orchestratorRules    string
+	env                  []string
+	symlink              []string
+	postCreate           []string
+	trackerIntake        bool
+	trackerRepo          string
+	trackerAssignee      string
+	trackerProjectID     string
+	trackerReadyStatus   string
+	trackerMaxConcurrent int
+	configJSON           string
+	clear                bool
+	json                 bool
 }
 
 type projectListResult struct {
@@ -331,6 +333,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	f.StringVar(&opts.trackerAssignee, "tracker-assignee", "", "GitHub issue assignee required for intake eligibility")
 	f.StringVar(&opts.trackerProjectID, "tracker-project-id", "", "GitHub Projects v2 board node id (PVT_...); switches intake to the board")
 	f.StringVar(&opts.trackerReadyStatus, "tracker-ready-status", "", "Board column intake claims cards from (default: Ready)")
+	f.IntVar(&opts.trackerMaxConcurrent, "tracker-max-concurrent", 0, "Cap on live intake-started sessions for this project (0: unlimited)")
 	f.StringVar(&opts.configJSON, "config-json", "", "Full config as a JSON object (overrides field flags)")
 	f.BoolVar(&opts.clear, "clear", false, "Clear all config")
 	f.BoolVar(&opts.json, "json", false, "Output the updated project as JSON")
@@ -370,12 +373,13 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 		Worker:            roleOverride{Agent: opts.workerAgent},
 		Orchestrator:      roleOverride{Agent: opts.orchestratorAgent},
 		TrackerIntake: trackerIntakeConfig{
-			Enabled:     opts.trackerIntake,
-			Provider:    trackerProviderForFlags(opts),
-			Repo:        opts.trackerRepo,
-			Assignee:    opts.trackerAssignee,
-			ProjectID:   opts.trackerProjectID,
-			ReadyStatus: opts.trackerReadyStatus,
+			Enabled:       opts.trackerIntake,
+			Provider:      trackerProviderForFlags(opts),
+			Repo:          opts.trackerRepo,
+			Assignee:      opts.trackerAssignee,
+			ProjectID:     opts.trackerProjectID,
+			ReadyStatus:   opts.trackerReadyStatus,
+			MaxConcurrent: opts.trackerMaxConcurrent,
 		},
 	}
 	if reflect.DeepEqual(cfg, projectConfig{}) {
@@ -391,7 +395,7 @@ func trackerProviderForFlags(opts projectSetConfigOptions) string {
 	if opts.trackerProjectID != "" || opts.trackerReadyStatus != "" {
 		return "github-projects"
 	}
-	if opts.trackerIntake || opts.trackerRepo != "" || opts.trackerAssignee != "" {
+	if opts.trackerIntake || opts.trackerRepo != "" || opts.trackerAssignee != "" || opts.trackerMaxConcurrent > 0 {
 		return "github"
 	}
 	return ""

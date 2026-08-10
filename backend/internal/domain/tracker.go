@@ -96,7 +96,7 @@ type ListFilter struct {
 type TrackerIntakeConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
 	// Provider defaults to github when Enabled is true.
-	Provider TrackerProvider `json:"provider,omitempty" enum:"github"`
+	Provider TrackerProvider `json:"provider,omitempty" enum:"github,github-projects"`
 	// Repo is the GitHub-native repository key ("owner/repo"). When empty, the
 	// intake loop derives it from the project's repo origin URL. GitHub only.
 	Repo string `json:"repo,omitempty"`
@@ -111,6 +111,12 @@ type TrackerIntakeConfig struct {
 	// ReadyStatus is the Status column intake claims cards from. Empty means
 	// DefaultProjectReadyStatus. github-projects only.
 	ReadyStatus string `json:"readyStatus,omitempty"`
+	// MaxConcurrent caps how many live intake-started sessions a project may
+	// have at once. Zero means unlimited. It is the throttle between a triaged
+	// backlog and the operator's agent-provider rate limits: without it,
+	// enabling intake on a board with a full Ready column spawns one session
+	// per card in a single tick.
+	MaxConcurrent int `json:"maxConcurrent,omitempty"`
 }
 
 // WithDefaults fills the provider only when intake is enabled. Disabled intake
@@ -142,6 +148,9 @@ func (c TrackerIntakeConfig) Validate() error {
 	}
 	if err := validateNoWhitespaceField("trackerIntake.projectId", c.ProjectID); err != nil {
 		return err
+	}
+	if c.MaxConcurrent < 0 {
+		return fmt.Errorf("trackerIntake.maxConcurrent: must not be negative, got %d", c.MaxConcurrent)
 	}
 	if c.Provider == TrackerProviderGitHubProjects {
 		// The board column is the eligibility rule here, so an assignee is not

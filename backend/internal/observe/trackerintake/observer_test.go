@@ -392,3 +392,65 @@ func (f *fakeSpawner) Spawn(_ context.Context, cfg ports.SpawnConfig) (domain.Se
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+func TestIntakeRespectsMaxConcurrent(t *testing.T) {
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#1"}, State: domain.IssueOpen},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#2"}, State: domain.IssueOpen},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#3"}, State: domain.IssueOpen},
+	}}
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "proj",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+				Enabled:       true,
+				Provider:      domain.TrackerProviderGitHub,
+				Assignee:      "*",
+				MaxConcurrent: 2,
+			}},
+		}},
+	}
+	for i := range tracker.issues {
+		tracker.issues[i].Assignees = []string{"octocat"}
+	}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 2 {
+		t.Fatalf("spawned %d sessions, want the 2 allowed by maxConcurrent", len(spawner.calls))
+	}
+}
+
+func TestIntakeCountsExistingLiveSessionsAgainstTheCap(t *testing.T) {
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#7"}, State: domain.IssueOpen, Assignees: []string{"octocat"}},
+	}}
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "proj",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+				Enabled:       true,
+				Provider:      domain.TrackerProviderGitHub,
+				Assignee:      "*",
+				MaxConcurrent: 1,
+			}},
+		}},
+		sessions: []domain.SessionRecord{{
+			ID:        "proj-1",
+			ProjectID: "proj",
+			IssueID:   "github:acme/demo#5",
+		}},
+	}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawned %d sessions, want none: the single slot is already taken by a live session", len(spawner.calls))
+	}
+}
