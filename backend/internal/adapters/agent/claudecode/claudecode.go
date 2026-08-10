@@ -191,6 +191,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	}
 	appendPermissionFlags(&cmd, permissions)
 	appendToolFlags(&cmd, cfg.AllowedTools, cfg.DisallowedTools)
+	appendRemoteControlFlags(&cmd, cfg.SessionID)
 
 	if model := strings.TrimSpace(cfg.Config.Model); model != "" {
 		cmd = append(cmd, "--model", model)
@@ -275,6 +276,10 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	cmd = append(cmd, binary)
 	appendPermissionFlags(&cmd, cfg.Permissions)
 	appendToolFlags(&cmd, cfg.AllowedTools, cfg.DisallowedTools)
+	// A restored session must stay reachable from Claude Desktop/mobile, so the
+	// Remote Control name is re-derived from the AO session id, not the native
+	// Claude UUID: the name has to survive across restores.
+	appendRemoteControlFlags(&cmd, cfg.Session.ID)
 	if cfg.SystemPromptFile != "" {
 		if err := validateClaudeSystemPromptFile(cfg.SystemPromptFile); err != nil {
 			return nil, false, err
@@ -570,6 +575,64 @@ func appendToolFlags(cmd *[]string, allowed, disallowed []string) {
 	if len(disallowed) > 0 {
 		*cmd = append(*cmd, "--disallowedTools", strings.Join(disallowed, ","))
 	}
+}
+
+// Remote Control opt-in. AO_CLAUDE_REMOTE_CONTROL turns it on for interactive
+// launches; AO_CLAUDE_REMOTE_CONTROL_PREFIX namespaces the generated session
+// names so one Claude account can supervise several AO deployments.
+const (
+	remoteControlEnvVar    = "AO_CLAUDE_REMOTE_CONTROL"
+	remoteControlPrefixVar = "AO_CLAUDE_REMOTE_CONTROL_PREFIX"
+)
+
+// appendRemoteControlFlags emits --remote-control <prefix>/<session id> when the
+// deployment opted in. Remote Control mirrors an interactive session into Claude
+// Desktop and the mobile app, which is what lets a human answer a permission
+// prompt that falls outside the pre-approved allowlist without opening a
+// terminal on the host.
+//
+// It is env-gated rather than always-on because Remote Control publishes the
+// session to the operator's Claude account: a stock AO install must not start
+// doing that silently. Headless reviewer launches never go through here, so they
+// stay local.
+//
+// The name is omitted when there is no session id — `--remote-control` alone is
+// valid and Claude falls back to a hostname-derived name.
+func appendRemoteControlFlags(cmd *[]string, sessionID string) {
+	if !remoteControlEnabled() {
+		return
+	}
+	if name := remoteControlName(sessionID); name != "" {
+		*cmd = append(*cmd, "--remote-control", name)
+		return
+	}
+	*cmd = append(*cmd, "--remote-control")
+}
+
+// remoteControlEnabled reads the opt-in switch. Anything other than the
+// affirmative spellings below leaves Remote Control off, so a typo fails closed.
+func remoteControlEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(remoteControlEnvVar))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// remoteControlName builds "<prefix>/<session id>". A session id with no
+// configured prefix is returned bare; no session id yields "" so the caller
+// emits the flag without a name.
+func remoteControlName(sessionID string) string {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return ""
+	}
+	prefix := strings.Trim(strings.TrimSpace(os.Getenv(remoteControlPrefixVar)), "/")
+	if prefix == "" {
+		return id
+	}
+	return prefix + "/" + id
 }
 
 // claudeBinarySpec locates the claude binary: PATH first, then the native

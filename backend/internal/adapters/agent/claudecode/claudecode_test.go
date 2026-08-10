@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -993,4 +994,41 @@ func containsSubsequence(values, needle []string) bool {
 		}
 	}
 	return false
+}
+
+func TestGetLaunchCommandRemoteControl(t *testing.T) {
+	tests := []struct {
+		name      string
+		enabled   string
+		prefix    string
+		sessionID string
+		want      []string
+		absent    string
+	}{
+		{name: "off by default", sessionID: "vibeli-1", absent: "--remote-control"},
+		{name: "unrecognized value fails closed", enabled: "maybe", sessionID: "vibeli-1", absent: "--remote-control"},
+		{name: "on with prefix", enabled: "1", prefix: "vibeli", sessionID: "vibeli-1", want: []string{"--remote-control", "vibeli/vibeli-1"}},
+		{name: "on without prefix", enabled: "true", sessionID: "vibeli-1", want: []string{"--remote-control", "vibeli-1"}},
+		{name: "prefix slashes trimmed", enabled: "on", prefix: "/vibeli/", sessionID: "vibeli-1", want: []string{"--remote-control", "vibeli/vibeli-1"}},
+		{name: "no session id emits bare flag", enabled: "yes", prefix: "vibeli", want: []string{"--remote-control"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(remoteControlEnvVar, tt.enabled)
+			t.Setenv(remoteControlPrefixVar, tt.prefix)
+
+			p := &Plugin{resolvedBinary: "claude"}
+			cmd, err := p.GetLaunchCommand(context.Background(), ports.LaunchConfig{SessionID: tt.sessionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tt.want) > 0 && !containsSubsequence(cmd, tt.want) {
+				t.Fatalf("missing %v in %#v", tt.want, cmd)
+			}
+			if tt.absent != "" && slices.Contains(cmd, tt.absent) {
+				t.Fatalf("unexpected %q in %#v", tt.absent, cmd)
+			}
+		})
+	}
 }
