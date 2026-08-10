@@ -356,7 +356,10 @@ func trackerRepo(project domain.ProjectRecord, cfg domain.TrackerIntakeConfig) (
 	if provider == "" {
 		provider = domain.TrackerProviderGitHub
 	}
-	if provider != domain.TrackerProviderGitHub {
+	// Both GitHub-backed providers scope by repository. The board provider uses
+	// it to pick its own cards off a board that may span several repositories,
+	// so the repo is a filter there rather than the query target.
+	if provider != domain.TrackerProviderGitHub && provider != domain.TrackerProviderGitHubProjects {
 		return domain.TrackerRepo{}, false
 	}
 	native := strings.TrimSpace(cfg.Repo)

@@ -454,3 +454,23 @@ func TestIntakeCountsExistingLiveSessionsAgainstTheCap(t *testing.T) {
 		t.Fatalf("spawned %d sessions, want none: the single slot is already taken by a live session", len(spawner.calls))
 	}
 }
+
+func TestTrackerRepoScopesBoardProviderToTheProjectRepo(t *testing.T) {
+	project := domain.ProjectRecord{ID: "proj", RepoOriginURL: "https://github.com/acme/demo.git"}
+	cfg := domain.TrackerIntakeConfig{
+		Enabled:   true,
+		Provider:  domain.TrackerProviderGitHubProjects,
+		ProjectID: "PVT_board",
+	}
+
+	repo, ok := trackerRepo(project, cfg)
+	if !ok {
+		t.Fatal("board-backed intake must still resolve a repo scope: a board can span several repositories")
+	}
+	if repo.Native != "acme/demo" {
+		t.Fatalf("repo.Native = %q, want acme/demo", repo.Native)
+	}
+	if repo.Provider != domain.TrackerProviderGitHubProjects {
+		t.Fatalf("repo.Provider = %q, want github-projects", repo.Provider)
+	}
+}
