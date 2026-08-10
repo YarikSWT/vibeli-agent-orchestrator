@@ -255,3 +255,31 @@ func TestNewRequiresProjectID(t *testing.T) {
 		t.Fatal("New without a token must report ErrNoToken")
 	}
 }
+
+func TestStatusAcceptsBothIssueIDSpellings(t *testing.T) {
+	tracker := newTestTracker(t, &fakeBoard{})
+
+	// Intake stores the canonical prefixed form; a CLI-spawned session stores
+	// the bare id the operator typed. Both must find the same card.
+	for _, id := range []domain.IssueID{"github:acme/demo#74", "acme/demo#74", "ACME/Demo#74"} {
+		status, err := tracker.Status(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Status(%q): %v", id, err)
+		}
+		if status != "Ready" {
+			t.Fatalf("Status(%q) = %q, want Ready", id, status)
+		}
+	}
+}
+
+func TestSetStatusAcceptsBareIssueID(t *testing.T) {
+	board := &fakeBoard{}
+	tracker := newTestTracker(t, board)
+
+	if err := tracker.SetStatus(context.Background(), "acme/demo#74", "Done"); err != nil {
+		t.Fatal(err)
+	}
+	if len(board.mutations) != 1 || board.mutations[0]["item"] != "PVTI_ready" {
+		t.Fatalf("mutations = %#v, want one write against PVTI_ready", board.mutations)
+	}
+}

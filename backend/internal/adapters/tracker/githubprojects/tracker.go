@@ -91,9 +91,9 @@ type Tracker struct {
 
 	// itemMu guards the issue -> card mappings learned from every board read.
 	// The board is polled on a timer, so the map is refreshed continuously;
-	// it is bounded by the board size.
+	// it is bounded by the board size. Keys are normalized by issueKey.
 	itemMu    sync.Mutex
-	itemByID  map[domain.IssueID]string
+	itemByID  map[string]string
 	statusRef *statusFieldRef
 }
 
@@ -123,7 +123,7 @@ func New(opts Options) (*Tracker, error) {
 		readyStatus: strings.TrimSpace(opts.ReadyStatus),
 		statusField: strings.TrimSpace(opts.StatusField),
 		issues:      opts.Issues,
-		itemByID:    map[domain.IssueID]string{},
+		itemByID:    map[string]string{},
 	}
 	if t.http == nil {
 		t.http = &http.Client{Timeout: 30 * time.Second}
@@ -205,8 +205,9 @@ func (t *Tracker) Status(ctx context.Context, id domain.IssueID) (string, error)
 	if err != nil {
 		return "", err
 	}
+	want := issueKey(id)
 	for _, card := range cards {
-		if card.issueID == id {
+		if issueKey(card.issueID) == want {
 			return card.status, nil
 		}
 	}
@@ -423,15 +424,28 @@ func (t *Tracker) rememberItems(cards []card) {
 	t.itemMu.Lock()
 	defer t.itemMu.Unlock()
 	for _, c := range cards {
-		t.itemByID[c.issueID] = c.itemID
+		t.itemByID[issueKey(c.issueID)] = c.itemID
 	}
 }
 
 func (t *Tracker) lookupItem(id domain.IssueID) (string, bool) {
 	t.itemMu.Lock()
 	defer t.itemMu.Unlock()
-	itemID, ok := t.itemByID[id]
+	itemID, ok := t.itemByID[issueKey(id)]
 	return itemID, ok
+}
+
+// issueKey normalizes an issue id for comparison. Ids reach this adapter in two
+// spellings: intake stores the canonical "github:owner/repo#123", while a
+// session spawned from the CLI carries the bare "owner/repo#123" the operator
+// typed. Both name the same issue, so the provider prefix is dropped and the
+// remainder is folded to lower case (GitHub owner/repo are case-insensitive).
+func issueKey(id domain.IssueID) string {
+	native := strings.TrimSpace(string(id))
+	if _, rest, ok := strings.Cut(native, ":"); ok {
+		native = rest
+	}
+	return strings.ToLower(native)
 }
 
 const statusFieldQuery = `query($project:ID!,$field:String!){
