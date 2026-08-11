@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -70,12 +71,38 @@ func (s SingleTrackerResolver) Resolve(cfg domain.TrackerIntakeConfig) (ports.Tr
 	return nil, fmt.Errorf("tracker intake: no adapter for provider %q", provider)
 }
 
+// Gate is the intake pause switch. It exists so a human ("/pause" from chat) and
+// the agent provider's usage limits can both stop new work from being claimed
+// without tearing down the sessions already running.
+//
+// The zero value is usable and un-paused.
+type Gate struct{ paused atomic.Bool }
+
+// Pause stops new cards from being claimed. Live sessions are untouched.
+func (g *Gate) Pause() { g.paused.Store(true) }
+
+// Resume re-enables claiming.
+func (g *Gate) Resume() { g.paused.Store(false) }
+
+// Paused reports whether claiming is currently suspended.
+func (g *Gate) Paused() bool { return g != nil && g.paused.Load() }
+
+// Announcer receives human-facing conveyor events. It is optional: without a
+// notifier configured, intake stays silent.
+type Announcer interface {
+	Announce(text string)
+}
+
 // Config holds optional observer knobs. Zero values use production defaults.
 type Config struct {
 	Tick           time.Duration
 	FailureBackoff time.Duration
 	Clock          func() time.Time
 	Logger         *slog.Logger
+	// Gate, when set, suspends claiming while paused.
+	Gate *Gate
+	// Announcer, when set, is told about each claimed card.
+	Announcer Announcer
 }
 
 // Observer polls configured projects and starts sessions for eligible issues.
@@ -88,11 +115,13 @@ type Observer struct {
 	clock          func() time.Time
 	logger         *slog.Logger
 	backoffUntil   map[string]time.Time
+	gate           *Gate
+	announcer      Announcer
 }
 
 // New constructs an Observer with safe defaults.
 func New(resolver TrackerResolver, store Store, spawner Spawner, cfg Config) *Observer {
-	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, backoffUntil: map[string]time.Time{}}
+	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, backoffUntil: map[string]time.Time{}, gate: cfg.Gate, announcer: cfg.Announcer}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -123,6 +152,10 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	if o.resolver == nil || o.store == nil || o.spawner == nil {
+		return nil
+	}
+	if o.gate.Paused() {
+		o.logger.Debug("tracker intake: paused, not claiming new cards")
 		return nil
 	}
 	now := o.clock().UTC()
@@ -222,15 +255,19 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		if issueID == "" || seen[issueID] {
 			continue
 		}
-		if _, _, _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
+		session, _, _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
 			ProjectID: projectID,
 			IssueID:   issueID,
 			Kind:      domain.KindWorker,
 			Prompt:    BuildIssuePrompt(issue),
-		}); err != nil {
+		})
+		if err != nil {
 			o.logger.Error("tracker intake: spawn issue session failed", "project", project.ID, "issue", issueID, "err", err)
 			spawnFailed = true
 			continue
+		}
+		if o.announcer != nil {
+			o.announcer.Announce(fmt.Sprintf("🤖 взял в работу %s\n%s\n\nсессия: %s · проект: %s", issue.ID.Native, strings.TrimSpace(issue.Title), session.ID, project.ID))
 		}
 		seen[issueID] = true
 		live[projectID]++

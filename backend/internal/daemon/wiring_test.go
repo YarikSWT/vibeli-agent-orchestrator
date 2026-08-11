@@ -372,7 +372,7 @@ func TestStartTrackerIntake_RunsEvenWithoutEnabledProjects(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done, syncDone := startTrackerIntake(ctx, store, svc, log)
+	done, syncDone := startTrackerIntake(ctx, store, svc, startChatNotifier(ctx, log), log)
 
 	for name, ch := range map[string]<-chan struct{}{"intake": done, "project sync": syncDone} {
 		select {

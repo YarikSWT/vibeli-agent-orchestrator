@@ -49,6 +49,8 @@ type lifecycleStack struct {
 	trackerDone   <-chan struct{}
 	// projectSyncDone closes when the Projects v2 status-sync loop has stopped.
 	projectSyncDone <-chan struct{}
+	// chatBotDone closes when the chat command loop has stopped.
+	chatBotDone <-chan struct{}
 }
 
 // startLifecycle constructs the Lifecycle Manager over the store and starts the
@@ -107,6 +109,9 @@ func (l *lifecycleStack) Stop() {
 	}
 	if l.scmDone != nil {
 		<-l.scmDone
+	}
+	if l.chatBotDone != nil {
+		<-l.chatBotDone
 	}
 	if l.projectSyncDone != nil {
 		<-l.projectSyncDone

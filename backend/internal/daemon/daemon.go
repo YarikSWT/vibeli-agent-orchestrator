@@ -150,7 +150,13 @@ func Run() error {
 	lifecycleMessenger := newModeAwareMessenger()
 	notificationHub := notify.NewHub()
 	notifier := notificationsvc.New(notificationsvc.Deps{Store: store})
-	notificationWriter := notify.New(notify.Deps{Store: store, Publisher: notificationHub})
+	// The chat notifier is opt-in (AO_TELEGRAM_BOT_TOKEN); without it the hub
+	// stays the only publisher and nothing leaves the machine.
+	chatNotifier := startChatNotifier(ctx, log)
+	notificationWriter := notify.New(notify.Deps{
+		Store:     store,
+		Publisher: notify.NewFanout(notificationHub, chatNotifier.publisher()),
+	})
 	// Resolution transitions that happened while the daemon was down never
 	// reached lifecycle, so re-check open notifications against the durable
 	// session/PR facts before serving. Best-effort: a failure here only leaves
@@ -259,7 +265,8 @@ func Run() error {
 		}
 		return err
 	}
-	lcStack.trackerDone, lcStack.projectSyncDone = startTrackerIntake(ctx, store, sessionSvc, log)
+	lcStack.trackerDone, lcStack.projectSyncDone = startTrackerIntake(ctx, store, sessionSvc, chatNotifier, log)
+	lcStack.chatBotDone = chatNotifier.startBot(ctx, store, sessionSvc)
 
 	agentSvc := agentsvc.NewWithDeps(agentsvc.Deps{Cache: store, Discoverer: modelcatalog.Discoverer{}, Projects: store})
 	go func() {

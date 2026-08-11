@@ -31,11 +31,18 @@ import (
 // The two loops share one board registry on purpose: it carries the issue ->
 // card index and the board's field ids, so reads done by intake spare the
 // status-sync writes a lookup and vice versa.
-func startTrackerIntake(ctx context.Context, store *sqlite.Store, sessions *sessionsvc.Service, logger *slog.Logger) (intakeDone, syncDone <-chan struct{}) {
+//
+// chat may be an inert notifier; intake then claims silently and its pause gate
+// simply has no one flipping it.
+func startTrackerIntake(ctx context.Context, store *sqlite.Store, sessions *sessionsvc.Service, chat *chatNotifier, logger *slog.Logger) (intakeDone, syncDone <-chan struct{}) {
 	issues := newLazyGitHubTracker(logger)
 	boards := newBoardRegistry(issues, logger)
 	resolver := &trackerProviderResolver{issues: issues, boards: boards}
-	intake := trackerintake.New(resolver, store, sessions, trackerintake.Config{Logger: logger})
+	intake := trackerintake.New(resolver, store, sessions, trackerintake.Config{
+		Logger:    logger,
+		Gate:      chat.intakeGate(),
+		Announcer: chat,
+	})
 	return intake.Start(ctx), startProjectStatusSync(ctx, boards, store, sessions, logger)
 }
 

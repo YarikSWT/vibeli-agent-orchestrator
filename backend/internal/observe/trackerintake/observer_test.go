@@ -474,3 +474,70 @@ func TestTrackerRepoScopesBoardProviderToTheProjectRepo(t *testing.T) {
 		t.Fatalf("repo.Provider = %q, want github-projects", repo.Provider)
 	}
 }
+
+func TestPausedGateStopsClaiming(t *testing.T) {
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#1"}, State: domain.IssueOpen, Assignees: []string{"octocat"}},
+	}}
+	store := &fakeStore{projects: []domain.ProjectRecord{{
+		ID:            "proj",
+		RepoOriginURL: "https://github.com/acme/demo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+			Enabled: true, Provider: domain.TrackerProviderGitHub, Assignee: "*",
+		}},
+	}}}
+	spawner := &fakeSpawner{}
+	gate := &Gate{}
+	gate.Pause()
+
+	observer := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger(), Gate: gate})
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("a paused gate must not claim cards, spawned %d", len(spawner.calls))
+	}
+
+	gate.Resume()
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawner.calls) != 1 {
+		t.Fatalf("after resume the card must be claimed, spawned %d", len(spawner.calls))
+	}
+}
+
+type recordingAnnouncer struct{ messages []string }
+
+func (r *recordingAnnouncer) Announce(text string) { r.messages = append(r.messages, text) }
+
+func TestAnnouncerHearsAboutClaimedCards(t *testing.T) {
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{
+			ID:        domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#16"},
+			Title:     "агент уходит в луп",
+			State:     domain.IssueOpen,
+			Assignees: []string{"octocat"},
+		},
+	}}
+	store := &fakeStore{projects: []domain.ProjectRecord{{
+		ID:            "proj",
+		RepoOriginURL: "https://github.com/acme/demo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+			Enabled: true, Provider: domain.TrackerProviderGitHub, Assignee: "*",
+		}},
+	}}}
+	announcer := &recordingAnnouncer{}
+
+	if err := New(singleResolver(tracker), store, &fakeSpawner{}, Config{Logger: discardLogger(), Announcer: announcer}).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(announcer.messages) != 1 {
+		t.Fatalf("got %d announcements, want 1", len(announcer.messages))
+	}
+	for _, want := range []string{"acme/demo#16", "агент уходит в луп", "proj-1"} {
+		if !strings.Contains(announcer.messages[0], want) {
+			t.Errorf("announcement missing %q:\n%s", want, announcer.messages[0])
+		}
+	}
+}
