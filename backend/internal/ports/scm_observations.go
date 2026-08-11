@@ -207,6 +207,28 @@ type SCMReviewObservation struct {
 	// bounded review-thread window instead of a complete PR-lifetime snapshot.
 	// Consumers should treat Threads as a merge/update set in that case.
 	Partial bool
+	// Mentions are PR-timeline comments that addressed the agent by name.
+	// Timeline comments are not review feedback — they carry no file, no line
+	// and no resolved state — so they are kept apart from Threads: they must
+	// reach the agent, but must never count as unresolved review feedback that
+	// blocks merge readiness.
+	Mentions []SCMMentionObservation
+}
+
+// SCMMentionObservation is a single PR-timeline comment addressed to the agent.
+// Only comments written by a human and carrying the configured trigger phrase
+// become mentions, so people can discuss a PR without waking the agent.
+type SCMMentionObservation struct {
+	// ID is the provider comment id, used to tell a new mention from a re-read.
+	ID string
+	// Author is the commenter's provider login.
+	Author string
+	// Body is the raw comment text, trigger phrase included.
+	Body string
+	// URL is the browser link to the comment itself, not the PR.
+	URL string
+	// CreatedAt is when the provider recorded the comment.
+	CreatedAt time.Time
 }
 
 // SCMReviewSummaryObservation is one submitted review with its provider summary URL.

@@ -1050,6 +1050,7 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		obs.Review.Reviews = review.Reviews
 		obs.Review.Threads = review.Threads
 		obs.Review.Partial = review.Partial
+		obs.Review.Mentions = review.Mentions
 		obs.ObservedAt = now
 		observations[pkey] = obs
 		subjectsByPR[pkey] = s

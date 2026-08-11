@@ -5,6 +5,8 @@ package daemon
 // by resolving tokens lazily inside the background observer path.
 
 import (
+	"strings"
+	"os"
 	"context"
 	"errors"
 	"log/slog"
@@ -41,7 +43,14 @@ func newGitHubSCMProvider(logger *slog.Logger) (*scmgithub.Provider, error) {
 	// GHTokenSource may shell out to `gh`, which is too slow/flaky for the startup
 	// readiness path. Provider calls resolve credentials lazily when claim-pr or
 	// the background observer actually needs GitHub.
-	return scmgithub.NewProvider(scmgithub.ProviderOptions{Token: tokens, SkipTokenPreflight: true, Logger: logger})
+	return scmgithub.NewProvider(scmgithub.ProviderOptions{
+		Token:              tokens,
+		SkipTokenPreflight: true,
+		Logger:             logger,
+		// Which phrase in a PR-timeline comment is meant for the agent. Empty
+		// keeps the default, so a deployment that never sets it still works.
+		MentionTrigger: strings.TrimSpace(os.Getenv("AO_PR_MENTION_TRIGGER")),
+	})
 }
 
 func logSCMProviderDisabled(logger *slog.Logger, err error) {

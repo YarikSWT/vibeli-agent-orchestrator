@@ -357,7 +357,65 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	}
 	m.emitNotification(ctx, intent)
 	m.resolveNotifications(ctx, readyToMergeResolutions(id, o, m.clock())...)
+	m.deliverMentions(ctx, id, o)
 	return nil
+}
+
+// deliverMentions hands PR-timeline comments addressed to the agent straight to
+// its session. Review threads already reach the agent, but a plain comment under
+// the PR is where a human's first instinct goes, and until now it went nowhere.
+//
+// Only the newest mention is pasted, keyed on its comment id: sendOnce skips a
+// repeat of the same id, and the message points at the PR so the agent can read
+// the rest of the thread itself if several arrived at once.
+func (m *Manager) deliverMentions(ctx context.Context, id domain.SessionID, o ports.SCMObservation) {
+	newest, ok := newestMention(o.Review.Mentions)
+	if !ok {
+		return
+	}
+	msg := formatMentionMessage(newest, o.PR.Number)
+	if _, err := m.sendOnce(ctx, id, o.PR.URL, "mention:"+o.PR.URL, newest.ID, msg, 0); err != nil {
+		slog.Default().Warn("lifecycle: mention delivery failed", "session", id, "pr", o.PR.URL, "err", err)
+	}
+}
+
+// newestMention picks the most recent comment; ties fall back to the later id,
+// since provider timestamps have second resolution and two comments can share one.
+func newestMention(mentions []ports.SCMMentionObservation) (ports.SCMMentionObservation, bool) {
+	var newest ports.SCMMentionObservation
+	found := false
+	for _, mention := range mentions {
+		switch {
+		case !found:
+		case mention.CreatedAt.After(newest.CreatedAt):
+		case mention.CreatedAt.Equal(newest.CreatedAt) && mention.ID > newest.ID:
+		default:
+			continue
+		}
+		newest = mention
+		found = true
+	}
+	return newest, found
+}
+
+// formatMentionMessage renders the comment as an instruction the agent can act
+// on. Control characters are stripped: the body is attacker-controlled text
+// that lands in a terminal.
+func formatMentionMessage(mention ports.SCMMentionObservation, prNumber int) string {
+	var b strings.Builder
+	b.WriteString("A comment on ")
+	if prNumber > 0 {
+		fmt.Fprintf(&b, "PR #%d", prNumber)
+	} else {
+		b.WriteString("your PR")
+	}
+	fmt.Fprintf(&b, " asks you to act. From @%s:\n\n", domain.SanitizeControlChars(mention.Author))
+	b.WriteString(domain.SanitizeControlChars(strings.TrimSpace(mention.Body)))
+	if mention.URL != "" {
+		b.WriteString("\n\nComment: " + domain.SanitizeControlChars(mention.URL))
+	}
+	b.WriteString("\n\nIf more comments arrived, read the full thread before replying.")
+	return b.String()
 }
 
 // readyToMergeResolutions reports the ready-to-merge notification this

@@ -63,6 +63,14 @@ func (f *fakeGH) serve(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, recordedReq{Method: r.Method, Path: r.URL.Path, Header: hdrCopy, Body: string(body)})
 	h, ok := f.handlers[r.Method+" "+r.URL.Path]
 	f.mu.Unlock()
+	// A review refresh also reads PR-timeline comments looking for mentions.
+	// Tests that only care about review threads should not have to stub it, and
+	// an empty timeline is the honest default.
+	if !ok && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/comments") && strings.Contains(r.URL.Path, "/issues/") {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("[]"))
+		return
+	}
 	if !ok {
 		f.t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		http.Error(w, "no handler", http.StatusNotImplemented)

@@ -35,6 +35,9 @@ type ProviderOptions struct {
 	GraphQLURL         string
 	UserAgent          string
 	Logger             *slog.Logger
+	// MentionTrigger overrides the phrase that addresses the agent in a
+	// PR-timeline comment (default "@ao").
+	MentionTrigger string
 }
 
 // Provider observes one GitHub pull request and returns a normalized
@@ -42,8 +45,11 @@ type ProviderOptions struct {
 // loop in v1 — the loop is a follow-up PR (#35); this adapter is the
 // observation primitive that loop will call.
 type Provider struct {
-	client           *Client
-	logger           *slog.Logger
+	client *Client
+	logger *slog.Logger
+	// mentionTriggerPhrase is the phrase that makes a PR-timeline comment an
+	// instruction for the agent. Empty falls back to DefaultMentionTrigger.
+	mentionTriggerPhrase string
 	identityMu       sync.Mutex
 	identity         ports.SCMIdentity
 	identityResolved bool
@@ -75,7 +81,7 @@ func NewProvider(opts ProviderOptions) (*Provider, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Provider{client: c, logger: logger}, nil
+	return &Provider{client: c, logger: logger, mentionTriggerPhrase: opts.MentionTrigger}, nil
 }
 
 // SCMCredentialsAvailable checks whether this provider can obtain a token. The

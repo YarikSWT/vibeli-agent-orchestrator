@@ -275,8 +275,9 @@ func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (
 	if err != nil {
 		return ports.SCMReviewObservation{}, err
 	}
+	mentions := p.fetchMentions(ctx, ref, time.Now())
 	if !boolv(pi["hasPreviousPage"]) {
-		return ports.SCMReviewObservation{Decision: decision, Reviews: reviews, Threads: latest}, nil
+		return ports.SCMReviewObservation{Decision: decision, Reviews: reviews, Threads: latest, Mentions: mentions}, nil
 	}
 	out := latest
 	startCursor := str(pi["startCursor"])
@@ -305,7 +306,7 @@ func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (
 			}
 		}
 	}
-	return ports.SCMReviewObservation{Decision: decision, Reviews: reviews, Threads: out, Partial: true}, nil
+	return ports.SCMReviewObservation{Decision: decision, Reviews: reviews, Threads: out, Partial: true, Mentions: mentions}, nil
 }
 
 type restListPull struct {

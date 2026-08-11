@@ -3518,3 +3518,78 @@ func TestActivitySignalRejectsStaleChatControllerGenerationAcrossHandoff(t *test
 		t.Fatalf("old Chat controller changed TUI activity to %q", got)
 	}
 }
+
+func mentionObservation(mentions ...ports.SCMMentionObservation) ports.SCMObservation {
+	return ports.SCMObservation{
+		Fetched:      true,
+		PR:           ports.SCMPRObservation{URL: "pr1", Number: 80},
+		CI:           ports.SCMCIObservation{Summary: string(domain.CIPassing)},
+		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)},
+		Review:       ports.SCMReviewObservation{Mentions: mentions},
+	}
+}
+
+func TestSCMObservation_MentionReachesTheAgent(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	at := time.Now().UTC()
+
+	obs := mentionObservation(ports.SCMMentionObservation{
+		ID: "5252535871", Author: "YarikSWT", Body: "@ao прикрепи скриншот", CreatedAt: at,
+		URL: "https://github.com/o/r/pull/80#issuecomment-5252535871",
+	})
+	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(msg.msgs) != 1 {
+		t.Fatalf("want the comment delivered to the session, got %v", msg.msgs)
+	}
+	for _, want := range []string{"PR #80", "@YarikSWT", "прикрепи скриншот", "issuecomment-5252535871"} {
+		if !strings.Contains(msg.msgs[0], want) {
+			t.Errorf("message missing %q:\n%s", want, msg.msgs[0])
+		}
+	}
+}
+
+func TestSCMObservation_MentionIsDeliveredOnce(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+	at := time.Now().UTC()
+	mention := ports.SCMMentionObservation{ID: "1", Author: "alice", Body: "@ao почини", CreatedAt: at}
+
+	for range 3 {
+		if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The observer re-reads the timeline every couple of minutes; the same
+	// comment must not be pasted into the session on every poll.
+	if len(msg.msgs) != 1 {
+		t.Fatalf("re-reading the same comment sent %d messages, want 1", len(msg.msgs))
+	}
+
+	newer := ports.SCMMentionObservation{ID: "2", Author: "alice", Body: "@ao и ещё вот это", CreatedAt: at.Add(time.Minute)}
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention, newer)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 2 {
+		t.Fatalf("a newer comment must be delivered, got %v", msg.msgs)
+	}
+	if !strings.Contains(msg.msgs[1], "и ещё вот это") {
+		t.Fatalf("second message should carry the newest comment:\n%s", msg.msgs[1])
+	}
+}
+
+func TestSCMObservation_NoMentionsSendsNothing(t *testing.T) {
+	m, st, msg := newManager()
+	st.sessions["mer-1"] = working("mer-1")
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation()); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("a PR with no mentions must not nudge the agent: %v", msg.msgs)
+	}
+}
