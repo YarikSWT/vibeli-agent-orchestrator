@@ -252,3 +252,25 @@ func TestUnreadablePRsCountAgainstTheCap(t *testing.T) {
 		t.Fatalf("spawned %d, want 0: over-counting only delays a claim, under-counting breaks the cap", len(spawner.calls))
 	}
 }
+
+func TestClaimedSessionsTearDownOnMerge(t *testing.T) {
+	store := &fakeStore{projects: []domain.ProjectRecord{manualProject("proj", "https://github.com/acme/demo.git")}}
+
+	auto := &fakeSpawner{}
+	autoObserver := New(singleResolver(manualTracker()), store, auto, Config{Logger: discardLogger()})
+	if err := autoObserver.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(auto.calls) != 1 || !auto.calls[0].TerminateOnPRMerge {
+		t.Fatalf("automatic intake must set TerminateOnPRMerge, got %+v", auto.calls)
+	}
+
+	manual := &fakeSpawner{}
+	manualObserver := New(singleResolver(manualTracker()), store, manual, Config{Logger: discardLogger()})
+	if _, err := manualObserver.Claim(context.Background(), "53"); err != nil {
+		t.Fatal(err)
+	}
+	if len(manual.calls) != 1 || !manual.calls[0].TerminateOnPRMerge {
+		t.Fatalf("/take must set TerminateOnPRMerge too, got %+v", manual.calls)
+	}
+}

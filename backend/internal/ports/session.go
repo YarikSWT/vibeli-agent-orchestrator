@@ -35,6 +35,10 @@ type SpawnConfig struct {
 	// DisplayName is the user-facing sidebar label. Empty falls back to the
 	// session id in the read model (e.g. orchestrator sessions).
 	DisplayName string
+	// TerminateOnPRMerge tears the session down once its PR set completes
+	// through a merge. Conveyor-style callers set it so a finished task cleans
+	// up its own worktree and container instead of lingering as a live session.
+	TerminateOnPRMerge bool
 	// Attachments are files pasted or dropped into the task brief. They are
 	// written into the session worktree and referenced by path in the prompt so
 	// the agent can read them (CLI agents receive the prompt as text and cannot

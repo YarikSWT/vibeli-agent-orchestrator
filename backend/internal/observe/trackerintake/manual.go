@@ -101,10 +101,11 @@ func (o *Observer) Claim(ctx context.Context, ref string) (ClaimResult, error) {
 		return ClaimResult{}, fmt.Errorf("%s not found", native)
 	}
 	session, _, _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
-		ProjectID: domain.ProjectID(project.ID),
-		IssueID:   CanonicalIssueID(issue.ID),
-		Kind:      domain.KindWorker,
-		Prompt:    BuildIssuePrompt(issue),
+		ProjectID:          domain.ProjectID(project.ID),
+		IssueID:            CanonicalIssueID(issue.ID),
+		Kind:               domain.KindWorker,
+		Prompt:             BuildIssuePrompt(issue),
+		TerminateOnPRMerge: true,
 	})
 	if err != nil {
 		return ClaimResult{}, fmt.Errorf("spawn %s: %w", native, err)

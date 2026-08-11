@@ -263,6 +263,9 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 			IssueID:   issueID,
 			Kind:      domain.KindWorker,
 			Prompt:    BuildIssuePrompt(issue),
+			// A merged PR means the task is done: tear the session down instead
+			// of leaving its worktree and agent process behind.
+			TerminateOnPRMerge: true,
 		})
 		if err != nil {
 			o.logger.Error("tracker intake: spawn issue session failed", "project", project.ID, "issue", issueID, "err", err)

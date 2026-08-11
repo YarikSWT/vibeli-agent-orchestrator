@@ -2886,8 +2886,9 @@ func seedRecord(cfg ports.SpawnConfig, now time.Time) domain.SessionRecord {
 		Activity:    domain.Activity{State: domain.ActivityIdle, LastActivityAt: now},
 		// Resolved before this point and persisted here. There is no UPDATE
 		// statement that can change it afterwards.
-		Mode:             domain.NormalizeSessionMode(cfg.RequestedMode),
-		AutoInjectReview: true,
+		Mode:               domain.NormalizeSessionMode(cfg.RequestedMode),
+		AutoInjectReview:   true,
+		TerminateOnPRMerge: cfg.TerminateOnPRMerge,
 	}
 }
 
