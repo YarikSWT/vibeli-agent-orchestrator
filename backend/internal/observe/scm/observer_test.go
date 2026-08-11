@@ -1711,3 +1711,37 @@ func TestPoll_MentionFailureDoesNotFailThePoll(t *testing.T) {
 		t.Fatal("PR/CI facts should still reach lifecycle")
 	}
 }
+
+func TestPoll_MentionReachesLifecycleOnAnUnchangedPR(t *testing.T) {
+	store := testStoreWithSession()
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs:      map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {{URL: "https://github.com/o/r/pull/1", Number: 1, SourceBranch: "feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1"}}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+
+	// First poll settles the PR facts, so nothing is "changed" afterwards.
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := len(lc.observed)
+
+	// A comment arrives, but no PR fact moves: no metadata, no CI, no review.
+	provider.mentions = map[string][]ports.SCMMentionObservation{
+		prKey(testRepo, 1): {{ID: "42", Author: "alice", Body: "@ao почини", CreatedAt: time.Unix(2, 0).UTC()}},
+	}
+	obs.Cache.LastMentionPollAt = map[string]time.Time{}
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(lc.observed) != before+1 {
+		t.Fatalf("lifecycle calls = %d, want one more: an unchanged PR still has to deliver the comment", len(lc.observed))
+	}
+	last := lc.observed[len(lc.observed)-1]
+	if len(last.Review.Mentions) != 1 || last.Review.Mentions[0].ID != "42" {
+		t.Fatalf("delivered observation = %+v, want the mention", last.Review.Mentions)
+	}
+}

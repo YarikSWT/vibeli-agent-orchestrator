@@ -375,6 +375,15 @@ func (o *Observer) Poll(ctx context.Context) error {
 		prepared := o.prepareForPersistence(obs, local, opts, now)
 		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
 			prRefreshOK[key] = true
+			// A timeline mention is not a persisted fact, so it moves none of the
+			// semantic hashes and an otherwise unchanged poll would drop it here.
+			// Hand it to lifecycle without a DB write: delivery is deduplicated
+			// downstream by comment id.
+			if len(prepared.Review.Mentions) > 0 && o.lifecycle != nil {
+				if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
+					o.logger.Error("scm observer: mention delivery failed", "session", subj.session.ID, "pr", local.URL, "err", err)
+				}
+			}
 			continue
 		}
 		finalPR, finalChecks, finalReviews, finalThreads, finalComments := domainFromObservation(subj.session.ID, subj.session, prepared, local, opts, now)
@@ -1094,6 +1103,7 @@ func (o *Observer) refreshMentions(ctx context.Context, subjects map[string]*sub
 			o.logger.Warn("scm observer: mention refresh failed", "pr", s.known.URL, "err", err)
 			continue
 		}
+		o.logger.Debug("scm observer: timeline scanned", "pr", s.known.URL, "mentions", len(mentions))
 		if len(mentions) == 0 {
 			continue
 		}
