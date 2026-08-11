@@ -32,6 +32,10 @@ vi.mock("../lib/event-transport", () => ({
 vi.mock("../lib/api-client", () => ({
 	setApiBaseUrl: setApiBaseUrlMock,
 	setApiDaemonStatus: setApiDaemonStatusMock,
+	// daemon-status also reads the base URL: a partial mock leaves these
+	// undefined and every status call throws before reaching the assertions.
+	getApiBaseUrl: () => "",
+	hasExplicitApiBaseUrl: () => false,
 }));
 
 import { useDaemonStatus } from "./useDaemonStatus";

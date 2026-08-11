@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { components } from "../../api/schema";
 import { apiClient, hasTrustedApiBaseUrl } from "../lib/api-client";
 import { mockShellTerminals } from "../lib/mock-data";
+import { usesPreviewWorkspaceData } from "../lib/preview-mode";
 
 export type ShellTerminal = {
 	/** Runtime handle the terminal mux attaches to, exactly like a session pane's. */
@@ -20,7 +21,7 @@ export type ShellTerminal = {
 };
 
 export const shellTerminalsQueryKey = ["shell-terminals"] as const;
-const usePreviewData = import.meta.env.VITE_NO_ELECTRON === "1";
+const usePreviewData = usesPreviewWorkspaceData;
 
 function toShellTerminal(t: components["schemas"]["ShellTerminalResponse"]): ShellTerminal {
 	return {

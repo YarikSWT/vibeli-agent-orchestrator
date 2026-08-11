@@ -20,6 +20,14 @@ export function getApiBaseUrl(): string {
 	return runtimeApiBaseUrl ?? "";
 }
 
+// hasExplicitApiBaseUrl reports that VITE_AO_API_BASE_URL pinned the origin at
+// build time. A browser-served build reaches the daemon through its own origin
+// (a reverse proxy fronts /api and /mux), so daemon status must not be allowed
+// to repoint the client at a loopback port the browser cannot reach.
+export function hasExplicitApiBaseUrl(): boolean {
+	return explicitApiBaseUrl !== undefined;
+}
+
 export function hasTrustedApiBaseUrl(): boolean {
 	return runtimeApiBaseUrl !== null;
 }

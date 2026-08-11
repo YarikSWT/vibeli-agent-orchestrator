@@ -42,6 +42,15 @@ const POSTHOG_ORIGINS = (() => {
 	return origins;
 })();
 
+// Extra connect-src entries for a browser-served build. The desktop renderer
+// talks to a loopback daemon, but a build served over HTTPS reaches the daemon
+// through its own origin, and 'self' is not reliably read as covering wss:
+// across browsers. Comma-separated, e.g. "https://ao.example.com wss://ao.example.com".
+const EXTRA_CONNECT_SRC = (process.env.VITE_AO_CONNECT_SRC ?? "")
+	.split(/[\s,]+/)
+	.map((entry) => entry.trim())
+	.filter(Boolean);
+
 // CSP for the built renderer. The daemon is loopback-only, so network access is
 // pinned to 127.0.0.1 (REST + SSE over http, terminal mux over ws). Injected at
 // build time rather than written into index.html because the dev server needs
@@ -52,7 +61,9 @@ const CONTENT_SECURITY_POLICY = [
 	"style-src 'self' 'unsafe-inline'",
 	"img-src 'self' data: http://127.0.0.1:*",
 	"font-src 'self' data:",
-	["connect-src", "'self'", "http://127.0.0.1:*", "ws://127.0.0.1:*", ...POSTHOG_ORIGINS].filter(Boolean).join(" "),
+	["connect-src", "'self'", "http://127.0.0.1:*", "ws://127.0.0.1:*", ...EXTRA_CONNECT_SRC, ...POSTHOG_ORIGINS]
+		.filter(Boolean)
+		.join(" "),
 	"object-src 'none'",
 	"base-uri 'self'",
 	"frame-src 'none'",
