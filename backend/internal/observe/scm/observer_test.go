@@ -117,19 +117,22 @@ func (s *fakeStore) WriteSCMObservation(_ context.Context, pr domain.PullRequest
 }
 
 type fakeProvider struct {
-	mentions     map[string][]ports.SCMMentionObservation
-	mentionCalls int
-	mentionErr   error
-	mu           sync.Mutex
-	repoGuards   map[string]ports.SCMGuardResult
-	checkGuards  map[string]ports.SCMGuardResult
-	openPRs      map[string][]ports.SCMPRObservation
-	listErr      error
-	observations map[string]ports.SCMObservation
-	reviews      map[string]ports.SCMReviewObservation
-	logTails     map[string]string
-	fetchErr     error
-	reviewErr    error
+	bodyBlocks     map[string]string
+	bodyBlockCalls int
+	bodyBlockErr   error
+	mentions       map[string][]ports.SCMMentionObservation
+	mentionCalls   int
+	mentionErr     error
+	mu             sync.Mutex
+	repoGuards     map[string]ports.SCMGuardResult
+	checkGuards    map[string]ports.SCMGuardResult
+	openPRs        map[string][]ports.SCMPRObservation
+	listErr        error
+	observations   map[string]ports.SCMObservation
+	reviews        map[string]ports.SCMReviewObservation
+	logTails       map[string]string
+	fetchErr       error
+	reviewErr      error
 
 	credentialGate   bool
 	credentialOK     bool
@@ -234,6 +237,24 @@ func (p *fakeProvider) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef)
 		return ports.SCMReviewObservation{}, p.reviewErr
 	}
 	return p.reviews[prKey(ref.Repo, ref.Number)], nil
+}
+
+func (p *fakeProvider) EnsurePRBodyBlock(_ context.Context, ref ports.SCMPRRef, marker, block string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.bodyBlockErr != nil {
+		return false, p.bodyBlockErr
+	}
+	key := prKey(ref.Repo, ref.Number)
+	if p.bodyBlocks == nil {
+		p.bodyBlocks = map[string]string{}
+	}
+	if strings.Contains(p.bodyBlocks[key], marker) {
+		return false, nil
+	}
+	p.bodyBlocks[key] = marker + "\n" + block
+	p.bodyBlockCalls++
+	return true, nil
 }
 
 func (p *fakeProvider) FetchMentions(_ context.Context, ref ports.SCMPRRef) ([]ports.SCMMentionObservation, error) {
@@ -1743,5 +1764,88 @@ func TestPoll_MentionReachesLifecycleOnAnUnchangedPR(t *testing.T) {
 	last := lc.observed[len(lc.observed)-1]
 	if len(last.Review.Mentions) != 1 || last.Review.Mentions[0].ID != "42" {
 		t.Fatalf("delivered observation = %+v, want the mention", last.Review.Mentions)
+	}
+}
+
+func linkTestObserver(store *fakeStore, provider *fakeProvider, lc Lifecycle, base string) *Observer {
+	return New(provider, store, lc, Config{
+		Clock: func() time.Time { return time.Unix(1, 0).UTC() }, Tick: time.Hour,
+		Logger: quietSlog(), CacheMax: 128, IdentityResolver: provider, WebBaseURL: base,
+	})
+}
+
+func linkTestProvider() *fakeProvider {
+	return &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs:      map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {{URL: "https://github.com/o/r/pull/1", Number: 1, SourceBranch: "feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1"}}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+	}
+}
+
+func TestPoll_StampsSessionLinkIntoPRBody(t *testing.T) {
+	store := testStoreWithSession()
+	provider := linkTestProvider()
+	obs := linkTestObserver(store, provider, &fakeLifecycle{}, "https://ao-web.example.com/")
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	body := provider.bodyBlocks[prKey(testRepo, 1)]
+	session := store.sessions[0]
+	want := "https://ao-web.example.com/#/projects/" + string(session.ProjectID) + "/sessions/" + string(session.ID)
+	if !strings.Contains(body, want) {
+		t.Fatalf("PR body block = %q, want a link to %s", body, want)
+	}
+	// A trailing slash on the configured origin must not produce a double slash.
+	if strings.Contains(body, "com//") {
+		t.Fatalf("base URL was not normalized: %q", body)
+	}
+}
+
+func TestPoll_SessionLinkIsWrittenOnce(t *testing.T) {
+	store := testStoreWithSession()
+	provider := linkTestProvider()
+	obs := linkTestObserver(store, provider, &fakeLifecycle{}, "https://ao-web.example.com")
+
+	for range 3 {
+		if err := obs.Poll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if provider.bodyBlockCalls != 1 {
+		t.Fatalf("PR body written %d times, want 1", provider.bodyBlockCalls)
+	}
+}
+
+func TestPoll_NoWebURLLeavesPRBodiesAlone(t *testing.T) {
+	store := testStoreWithSession()
+	provider := linkTestProvider()
+	obs := linkTestObserver(store, provider, &fakeLifecycle{}, "")
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A desktop install has no shareable UI address; writing a localhost link
+	// into a public PR would be noise.
+	if provider.bodyBlockCalls != 0 {
+		t.Fatalf("PR body touched %d times without a configured UI", provider.bodyBlockCalls)
+	}
+}
+
+func TestPoll_SessionLinkFailureDoesNotFailThePoll(t *testing.T) {
+	store := testStoreWithSession()
+	provider := linkTestProvider()
+	provider.bodyBlockErr = errors.New("forbidden")
+	lc := &fakeLifecycle{}
+	obs := linkTestObserver(store, provider, lc, "https://ao-web.example.com")
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatalf("a cosmetic stamp must not fail the poll: %v", err)
+	}
+	if len(lc.observed) == 0 {
+		t.Fatal("PR facts should still reach lifecycle")
 	}
 }

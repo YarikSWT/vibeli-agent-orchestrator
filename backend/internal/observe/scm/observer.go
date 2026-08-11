@@ -53,6 +53,7 @@ type Provider interface {
 	FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRepo, check ports.SCMCheckObservation) (string, error)
 	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
 	FetchMentions(ctx context.Context, ref ports.SCMPRRef) ([]ports.SCMMentionObservation, error)
+	EnsurePRBodyBlock(ctx context.Context, ref ports.SCMPRRef, marker, block string) (bool, error)
 }
 
 // Store is the persistence contract the observer needs for discovery, local
@@ -88,6 +89,11 @@ type Config struct {
 	Logger *slog.Logger
 	// CacheMax bounds each in-memory ETag/review cache. Zero uses DefaultCacheMax.
 	CacheMax int
+	// WebBaseURL is the origin the AO web UI is served from. When set, the
+	// observer stamps a link to the owning session into each PR description.
+	// Empty disables the stamp, which is the right default for a desktop install
+	// whose UI has no address anyone else can open.
+	WebBaseURL string
 	// IdentityResolver resolves the active SCM account lazily. Nil preserves branch-based discovery.
 	IdentityResolver ports.SCMIdentityResolver
 }
@@ -103,6 +109,9 @@ type ObserverCache struct {
 	LastReviewPollAt map[string]time.Time
 	// LastMentionPollAt maps PR keys to the last timeline-comment fetch.
 	LastMentionPollAt map[string]time.Time
+	// SessionLinkStamped marks PRs whose description already links its session,
+	// so a healthy poll costs nothing after the first one.
+	SessionLinkStamped map[string]bool
 	// ReviewRefreshFailed marks PRs whose review-thread refresh failed; the
 	// next poll retries regardless of the normal review cadence/status rules.
 	ReviewRefreshFailed map[string]bool
@@ -120,6 +129,8 @@ type ObserverCache struct {
 	reviewFailedOrder []string
 	// lastMentionPollOrder tracks FIFO eviction order for LastMentionPollAt.
 	lastMentionPollOrder []string
+	// sessionLinkOrder tracks FIFO eviction order for SessionLinkStamped.
+	sessionLinkOrder []string
 	// max is the maximum number of entries each cache map retains.
 	max int
 }
@@ -133,6 +144,7 @@ func newCache(maxEntries int) ObserverCache {
 		CommitChecksETag:    map[string]string{},
 		LastReviewPollAt:    map[string]time.Time{},
 		LastMentionPollAt:   map[string]time.Time{},
+		SessionLinkStamped:  map[string]bool{},
 		ReviewRefreshFailed: map[string]bool{},
 		LastPRFetchAt:       map[string]time.Time{},
 		max:                 maxEntries,
@@ -150,6 +162,9 @@ type Observer struct {
 	lifecycle Lifecycle
 	// tick is the active PR/CI polling cadence.
 	tick time.Duration
+	// webBaseURL is the origin of the AO web UI, used to link a PR back to its
+	// session. Empty disables the stamp.
+	webBaseURL string
 	// reviewInterval is the minimum duration between review-thread fetches per PR.
 	reviewInterval time.Duration
 	// clock supplies observation timestamps.
@@ -169,7 +184,7 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, identityResolver: cfg.IdentityResolver, Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, identityResolver: cfg.IdentityResolver, webBaseURL: strings.TrimRight(strings.TrimSpace(cfg.WebBaseURL), "/"), Cache: newCache(cfg.CacheMax)}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -350,6 +365,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	reviewStale := map[string]bool{}
 	o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now)
 	o.refreshMentions(ctx, subjects, observations, selection.subjectsByPR, localOnlyObservations, now)
+	o.stampSessionLinks(ctx, subjects)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1077,6 +1093,56 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		}
 		cacheDelete(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey)
 	}
+}
+
+// stampSessionLinks writes a link to the owning AO session into each PR
+// description, once per PR.
+//
+// A PR is where a human lands when the conveyor pings them, and from there the
+// session that produced it is otherwise unfindable: the id appears nowhere in
+// the PR. The agent could be asked to include it, but then the link is only as
+// reliable as the agent's memory, and it is missing from PRs opened before the
+// prompt changed.
+func (o *Observer) stampSessionLinks(ctx context.Context, subjects map[string]*subject) {
+	if o.webBaseURL == "" {
+		return
+	}
+	for _, s := range subjects {
+		if !s.hasPR || s.known.Number <= 0 || s.known.Merged || s.known.Closed {
+			continue
+		}
+		pkey := prKey(s.repo, s.known.Number)
+		if o.Cache.SessionLinkStamped[pkey] {
+			continue
+		}
+		marker, block := sessionLinkBlock(o.webBaseURL, s.session)
+		if block == "" {
+			continue
+		}
+		ref := ports.SCMPRRef{Repo: s.repo, Number: s.known.Number, URL: s.known.URL}
+		stamped, err := o.provider.EnsurePRBodyBlock(ctx, ref, marker, block)
+		if err != nil {
+			// Cosmetic: a PR without the link is still a working PR, so this
+			// never fails a poll. It retries on the next one.
+			o.logger.Warn("scm observer: could not link PR to its session", "pr", s.known.URL, "err", err)
+			continue
+		}
+		o.cacheSetBool(o.Cache.SessionLinkStamped, &o.Cache.sessionLinkOrder, pkey, true)
+		if stamped {
+			o.logger.Info("scm observer: linked PR to its session", "pr", s.known.URL, "session", s.session.ID)
+		}
+	}
+}
+
+// sessionLinkBlock renders the marker and the Markdown appended to a PR body.
+func sessionLinkBlock(baseURL string, session domain.SessionRecord) (marker, block string) {
+	if session.ID == "" || session.ProjectID == "" {
+		return "", ""
+	}
+	marker = "<!-- ao:session-link -->"
+	link := fmt.Sprintf("%s/#/projects/%s/sessions/%s", baseURL, session.ProjectID, session.ID)
+	block = fmt.Sprintf("🤖 Сделано агентом в сессии [`%s`](%s) — терминал, чат и логи там.", session.ID, link)
+	return marker, block
 }
 
 // refreshMentions reads PR-timeline comments on their own cadence and attaches

@@ -30,6 +30,10 @@ func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.M
 	observer := scmobserve.New(provider, store, lcm, scmobserve.Config{
 		Logger:           logger,
 		IdentityResolver: provider,
+		// Where this daemon's web UI answers. Set it and every PR gets a link
+		// back to the session that produced it; leave it empty and nothing is
+		// written into PR descriptions.
+		WebBaseURL: strings.TrimSpace(os.Getenv("AO_WEB_BASE_URL")),
 	})
 	return observer.Start(ctx)
 }
