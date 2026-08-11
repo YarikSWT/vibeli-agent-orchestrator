@@ -117,6 +117,9 @@ func (s *fakeStore) WriteSCMObservation(_ context.Context, pr domain.PullRequest
 }
 
 type fakeProvider struct {
+	mentions     map[string][]ports.SCMMentionObservation
+	mentionCalls int
+	mentionErr   error
 	mu           sync.Mutex
 	repoGuards   map[string]ports.SCMGuardResult
 	checkGuards  map[string]ports.SCMGuardResult
@@ -231,6 +234,16 @@ func (p *fakeProvider) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef)
 		return ports.SCMReviewObservation{}, p.reviewErr
 	}
 	return p.reviews[prKey(ref.Repo, ref.Number)], nil
+}
+
+func (p *fakeProvider) FetchMentions(_ context.Context, ref ports.SCMPRRef) ([]ports.SCMMentionObservation, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.mentionCalls++
+	if p.mentionErr != nil {
+		return nil, p.mentionErr
+	}
+	return p.mentions[prKey(ref.Repo, ref.Number)], nil
 }
 
 type fakeLifecycle struct {
@@ -1625,5 +1638,76 @@ func TestDiscoverSubjects_NonGitPathDoesNotBackfill(t *testing.T) {
 	}
 	if got := store.projects["p"].RepoOriginURL; got != "" {
 		t.Fatalf("RepoOriginURL = %q, want empty (no persist on failed backfill)", got)
+	}
+}
+
+func TestPoll_MentionsAreReadWithoutAnyReview(t *testing.T) {
+	store := testStoreWithSession()
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs:      map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {{URL: "https://github.com/o/r/pull/1", Number: 1, SourceBranch: "feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1"}}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+		mentions: map[string][]ports.SCMMentionObservation{
+			prKey(testRepo, 1): {{ID: "42", Author: "alice", Body: "@ao почини", CreatedAt: time.Unix(2, 0).UTC()}},
+		},
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Review threads are only re-read when the review decision moves, so a PR
+	// nobody reviewed must still get its timeline scanned.
+	if provider.mentionCalls != 1 {
+		t.Fatalf("FetchMentions calls = %d, want 1", provider.mentionCalls)
+	}
+	var delivered []ports.SCMMentionObservation
+	for _, o := range lc.observed {
+		delivered = append(delivered, o.Review.Mentions...)
+	}
+	if len(delivered) != 1 || delivered[0].ID != "42" {
+		t.Fatalf("mentions handed to lifecycle = %+v, want the one comment", delivered)
+	}
+}
+
+func TestPoll_MentionPollIsRateLimited(t *testing.T) {
+	store := testStoreWithSession()
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs:      map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {{URL: "https://github.com/o/r/pull/1", Number: 1, SourceBranch: "feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1"}}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+	}
+	obs := newTestObserver(store, provider, &fakeLifecycle{}, time.Unix(1, 0).UTC())
+
+	for range 3 {
+		if err := obs.Poll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The fast PR/CI loop runs every 30s; timelines must not be read that often.
+	if provider.mentionCalls != 1 {
+		t.Fatalf("FetchMentions calls = %d, want 1 within the review interval", provider.mentionCalls)
+	}
+}
+
+func TestPoll_MentionFailureDoesNotFailThePoll(t *testing.T) {
+	store := testStoreWithSession()
+	provider := &fakeProvider{
+		repoGuards:   map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
+		openPRs:      map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {{URL: "https://github.com/o/r/pull/1", Number: 1, SourceBranch: "feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1"}}},
+		observations: map[string]ports.SCMObservation{prKey(testRepo, 1): testObs(1)},
+		mentionErr:   errors.New("timeline unavailable"),
+	}
+	lc := &fakeLifecycle{}
+	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatalf("a mention read failure must not fail the poll: %v", err)
+	}
+	if len(lc.observed) == 0 {
+		t.Fatal("PR/CI facts should still reach lifecycle")
 	}
 }

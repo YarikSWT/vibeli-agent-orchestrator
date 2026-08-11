@@ -39,9 +39,17 @@ type restIssueComment struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// fetchMentions reads recent PR-timeline comments and keeps the ones addressed
-// to the agent. A failure here is not fatal to the review poll: mentions are an
-// extra channel, and losing them must not cost AO its review threads.
+// FetchMentions reads recent PR-timeline comments and keeps the ones addressed
+// to the agent.
+//
+// It is deliberately its own provider call rather than a side effect of the
+// review poll: review threads are only re-read when the review decision changes,
+// so a PR nobody has formally reviewed — the common case — would never be
+// scanned for comments at all.
+func (p *Provider) FetchMentions(ctx context.Context, ref ports.SCMPRRef) ([]ports.SCMMentionObservation, error) {
+	return p.fetchMentions(ctx, ref, time.Now()), nil
+}
+
 func (p *Provider) fetchMentions(ctx context.Context, ref ports.SCMPRRef, now time.Time) []ports.SCMMentionObservation {
 	trigger := p.mentionTrigger()
 	if trigger == "" {

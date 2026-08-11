@@ -52,6 +52,7 @@ type Provider interface {
 	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
 	FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRepo, check ports.SCMCheckObservation) (string, error)
 	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
+	FetchMentions(ctx context.Context, ref ports.SCMPRRef) ([]ports.SCMMentionObservation, error)
 }
 
 // Store is the persistence contract the observer needs for discovery, local
@@ -100,6 +101,8 @@ type ObserverCache struct {
 	CommitChecksETag map[string]string
 	// LastReviewPollAt maps PR keys to the last review-thread fetch timestamp.
 	LastReviewPollAt map[string]time.Time
+	// LastMentionPollAt maps PR keys to the last timeline-comment fetch.
+	LastMentionPollAt map[string]time.Time
 	// ReviewRefreshFailed marks PRs whose review-thread refresh failed; the
 	// next poll retries regardless of the normal review cadence/status rules.
 	ReviewRefreshFailed map[string]bool
@@ -115,6 +118,8 @@ type ObserverCache struct {
 	lastReviewPollOrder []string
 	// reviewFailedOrder tracks FIFO eviction order for ReviewRefreshFailed.
 	reviewFailedOrder []string
+	// lastMentionPollOrder tracks FIFO eviction order for LastMentionPollAt.
+	lastMentionPollOrder []string
 	// max is the maximum number of entries each cache map retains.
 	max int
 }
@@ -127,6 +132,7 @@ func newCache(maxEntries int) ObserverCache {
 		RepoPRListETag:      map[string]string{},
 		CommitChecksETag:    map[string]string{},
 		LastReviewPollAt:    map[string]time.Time{},
+		LastMentionPollAt:   map[string]time.Time{},
 		ReviewRefreshFailed: map[string]bool{},
 		LastPRFetchAt:       map[string]time.Time{},
 		max:                 maxEntries,
@@ -343,6 +349,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	localOnlyObservations := map[string]bool{}
 	reviewStale := map[string]bool{}
 	o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now)
+	o.refreshMentions(ctx, subjects, observations, selection.subjectsByPR, localOnlyObservations, now)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1060,6 +1067,49 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 			reviewModes[pkey] = ports.ReviewWriteReplace
 		}
 		cacheDelete(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey)
+	}
+}
+
+// refreshMentions reads PR-timeline comments on their own cadence and attaches
+// the ones addressed to the agent to this poll's observation.
+//
+// It cannot ride along with refreshReviews: that one only re-reads a PR whose
+// review decision moved, so a PR with no formal review — most of them — would
+// never be scanned. When a PR has mentions but nothing else changed this poll,
+// an observation is built from local facts so lifecycle still gets called and
+// can hand the comment to the agent.
+func (o *Observer) refreshMentions(ctx context.Context, subjects map[string]*subject, observations map[string]ports.SCMObservation, subjectsByPR map[string]*subject, localOnlyObservations map[string]bool, now time.Time) {
+	for _, s := range subjects {
+		if !s.hasPR || s.known.Number <= 0 || s.known.Merged || s.known.Closed {
+			continue
+		}
+		pkey := prKey(s.repo, s.known.Number)
+		if last := o.Cache.LastMentionPollAt[pkey]; !last.IsZero() && now.Sub(last) < o.reviewInterval {
+			continue
+		}
+		o.cacheSetTime(o.Cache.LastMentionPollAt, &o.Cache.lastMentionPollOrder, pkey, now)
+
+		mentions, err := o.provider.FetchMentions(ctx, ports.SCMPRRef{Repo: s.repo, Number: s.known.Number, URL: s.known.URL})
+		if err != nil {
+			o.logger.Warn("scm observer: mention refresh failed", "pr", s.known.URL, "err", err)
+			continue
+		}
+		if len(mentions) == 0 {
+			continue
+		}
+		obs, hasObs := observations[pkey]
+		if !hasObs {
+			checks, err := o.store.ListChecks(ctx, s.known.URL)
+			if err != nil {
+				o.logger.Error("scm observer: list local checks for mention-only refresh failed", "pr", s.known.URL, "err", err)
+			}
+			obs = observationFromLocal(s.repo, s.known, checks)
+			localOnlyObservations[pkey] = true
+		}
+		obs.Review.Mentions = mentions
+		obs.ObservedAt = now
+		observations[pkey] = obs
+		subjectsByPR[pkey] = s
 	}
 }
 
