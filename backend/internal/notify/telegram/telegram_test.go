@@ -280,3 +280,49 @@ func TestSplitCommandHandlesGroupSuffix(t *testing.T) {
 		t.Fatalf("splitCommand = (%q, %q), want (/kill, vibeli-3)", command, arg)
 	}
 }
+
+func TestProxyTransportRoutesThroughTheProxy(t *testing.T) {
+	var proxied []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied = append(proxied, r.Host)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer proxy.Close()
+
+	// http:// target so the proxy sees an absolute-form request rather than
+	// CONNECT, which httptest cannot answer.
+	client := New(Config{Token: "tok", ChatID: "42", APIBase: "http://api.telegram.invalid", Proxy: proxy.URL})
+	if err := client.Send(context.Background(), "ping"); err != nil {
+		t.Fatal(err)
+	}
+	if len(proxied) != 1 || proxied[0] != "api.telegram.invalid" {
+		t.Fatalf("proxy saw %v, want one request for api.telegram.invalid", proxied)
+	}
+}
+
+func TestNoProxyConfiguredMeansDirect(t *testing.T) {
+	if got := proxyTransport("   "); got != nil {
+		t.Fatalf("empty proxy must mean direct, got %#v", got)
+	}
+	if got := proxyTransport("::not a url::"); got != nil {
+		t.Fatalf("malformed proxy must not construct a transport, got %#v", got)
+	}
+}
+
+func TestTransportErrorsNeverCarryTheToken(t *testing.T) {
+	// Nothing listens on this port, so client.Do fails and net/http quotes the
+	// full request URL — which is where the token lives.
+	client := New(Config{Token: "8981925447:SECRET", ChatID: "42", APIBase: "http://127.0.0.1:1"})
+
+	err := client.Send(context.Background(), "ping")
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("bot token leaked into the error text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "<token>") {
+		t.Fatalf("token should be redacted in place, got: %v", err)
+	}
+}

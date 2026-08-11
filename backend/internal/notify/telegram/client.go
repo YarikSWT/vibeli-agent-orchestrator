@@ -30,6 +30,10 @@ const (
 	EnvChatID   = "AO_TELEGRAM_CHAT_ID"
 	// EnvAPIBase overrides the Telegram API root; tests point it at httptest.
 	EnvAPIBase = "AO_TELEGRAM_API_BASE"
+	// EnvProxy routes Telegram traffic through an HTTP proxy. Required wherever
+	// api.telegram.org is blocked at the network level — the connection just
+	// times out there, so without a proxy the notifier retries forever.
+	EnvProxy = "AO_TELEGRAM_PROXY"
 
 	defaultAPIBase = "https://api.telegram.org"
 	// requestTimeout bounds a single sendMessage. Long polling sets its own.
@@ -38,17 +42,20 @@ const (
 
 // Client is a minimal Telegram Bot API client: send a message, read updates.
 type Client struct {
-	http    *http.Client
-	apiBase string
-	token   string
-	chatID  string
+	http      *http.Client
+	transport http.RoundTripper
+	apiBase   string
+	token     string
+	chatID    string
 }
 
 // Config configures a Client. Empty fields fall back to the environment.
 type Config struct {
-	Token      string
-	ChatID     string
-	APIBase    string
+	Token   string
+	ChatID  string
+	APIBase string
+	// Proxy is an HTTP proxy URL for Telegram traffic only. Empty means direct.
+	Proxy      string
 	HTTPClient *http.Client
 }
 
@@ -60,7 +67,12 @@ func NewFromEnv() (*Client, bool) {
 	if token == "" || chatID == "" {
 		return nil, false
 	}
-	return New(Config{Token: token, ChatID: chatID, APIBase: os.Getenv(EnvAPIBase)}), true
+	return New(Config{
+		Token:   token,
+		ChatID:  chatID,
+		APIBase: os.Getenv(EnvAPIBase),
+		Proxy:   os.Getenv(EnvProxy),
+	}), true
 }
 
 // New builds a client from an explicit config.
@@ -71,8 +83,9 @@ func New(cfg Config) *Client {
 		token:   strings.TrimSpace(cfg.Token),
 		chatID:  strings.TrimSpace(cfg.ChatID),
 	}
+	c.transport = proxyTransport(cfg.Proxy)
 	if c.http == nil {
-		c.http = &http.Client{Timeout: requestTimeout}
+		c.http = &http.Client{Timeout: requestTimeout, Transport: c.transport}
 	}
 	if c.apiBase == "" {
 		c.apiBase = defaultAPIBase
@@ -143,7 +156,10 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout+requestTimeout)
 	defer cancel()
-	if err := c.callWithClient(callCtx, &http.Client{Timeout: timeout + requestTimeout}, "getUpdates", payload, &resp); err != nil {
+	// A long poll needs its own deadline, but the same transport: dropping it
+	// here would silently bypass the proxy the rest of the client uses.
+	poller := &http.Client{Timeout: timeout + requestTimeout, Transport: c.transport}
+	if err := c.callWithClient(callCtx, poller, "getUpdates", payload, &resp); err != nil {
 		return nil, err
 	}
 	if !resp.OK {
@@ -183,7 +199,9 @@ func (c *Client) callWithClient(ctx context.Context, client *http.Client, method
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		// net/http puts the full request URL in transport errors, and the bot
+		// token lives in that URL. Logs must never carry it.
+		return fmt.Errorf("telegram: %s: %s", method, c.scrub(err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -191,11 +209,42 @@ func (c *Client) callWithClient(ctx context.Context, client *http.Client, method
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		// The token is in the URL, never in the message: errors are logged.
-		return fmt.Errorf("telegram: %s http %d: %s", method, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("telegram: %s http %d: %s", method, resp.StatusCode, c.scrub(strings.TrimSpace(string(raw))))
 	}
 	if out == nil {
 		return nil
 	}
 	return json.Unmarshal(raw, out)
+}
+
+// proxyTransport returns a transport routed through proxyURL, or nil (meaning
+// http.DefaultTransport) when no proxy is configured. A malformed URL also
+// yields nil rather than failing construction: the daemon must still boot, and
+// the misconfiguration surfaces on the first request as the underlying network
+// error instead of a silent no-notifier state.
+func proxyTransport(proxyURL string) http.RoundTripper {
+	raw := strings.TrimSpace(proxyURL)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return nil
+	}
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil
+	}
+	clone := transport.Clone()
+	clone.Proxy = http.ProxyURL(parsed)
+	return clone
+}
+
+// scrub removes the bot token from text bound for a log line. The token is part
+// of every request URL, so transport errors quote it verbatim.
+func (c *Client) scrub(text string) string {
+	if c.token == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, c.token, "<token>")
 }
