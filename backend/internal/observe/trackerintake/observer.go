@@ -36,6 +36,9 @@ const (
 type Store interface {
 	ListProjects(ctx context.Context) ([]domain.ProjectRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	// ListPRsBySession backs the "waiting on a human" test below: a session that
+	// already has an open PR is not doing work any more.
+	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
 }
 
 // Spawner is the session creation surface used by intake.
@@ -177,7 +180,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 		return err
 	}
 	seen := seenIssueIDs(sessions)
-	live := liveIntakeSessions(sessions)
+	live := o.liveIntakeSessions(ctx, sessions)
 	for _, project := range enabledProjects {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -279,16 +282,43 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 }
 
 // liveIntakeSessions counts the sessions that still occupy a concurrency slot:
-// started from an issue and not yet terminated.
-func liveIntakeSessions(sessions []domain.SessionRecord) map[domain.ProjectID]int {
+// started from an issue, not yet terminated, and not already parked on an open
+// pull request.
+//
+// The PR test is what keeps the conveyor moving. A session that opened its PR
+// is waiting on a human review-and-merge, which can take hours or days; counting
+// it as busy meant a cap of N stalled the whole board after N cards, with every
+// agent idle. Merged and closed PRs do not park a session: there the agent is
+// either done (and about to be torn down) or back at work on the same issue.
+func (o *Observer) liveIntakeSessions(ctx context.Context, sessions []domain.SessionRecord) map[domain.ProjectID]int {
 	live := map[domain.ProjectID]int{}
 	for _, session := range sessions {
 		if session.IsTerminated || session.IssueID == "" {
 			continue
 		}
+		if o.parkedOnOpenPR(ctx, session.ID) {
+			continue
+		}
 		live[session.ProjectID]++
 	}
 	return live
+}
+
+// parkedOnOpenPR reports whether the session has a pull request still open. A
+// read failure counts the session as busy: over-counting only delays a claim,
+// while under-counting would spawn past the cap.
+func (o *Observer) parkedOnOpenPR(ctx context.Context, id domain.SessionID) bool {
+	prs, err := o.store.ListPRsBySession(ctx, id)
+	if err != nil {
+		o.logger.Warn("tracker intake: could not read session PRs, counting it against the cap", "session", id, "err", err)
+		return false
+	}
+	for _, pr := range prs {
+		if !pr.Merged && !pr.Closed {
+			return true
+		}
+	}
+	return false
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {

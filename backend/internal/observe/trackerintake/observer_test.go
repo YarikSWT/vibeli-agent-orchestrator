@@ -340,6 +340,9 @@ type fakeStore struct {
 	projects    []domain.ProjectRecord
 	sessions    []domain.SessionRecord
 	sessionsErr error
+	// prs maps a session id to the PRs the store reports for it.
+	prs    map[domain.SessionID][]domain.PullRequest
+	prsErr error
 }
 
 func (f *fakeStore) ListProjects(context.Context) ([]domain.ProjectRecord, error) {
@@ -348,6 +351,13 @@ func (f *fakeStore) ListProjects(context.Context) ([]domain.ProjectRecord, error
 
 func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, error) {
 	return append([]domain.SessionRecord(nil), f.sessions...), f.sessionsErr
+}
+
+func (f *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]domain.PullRequest, error) {
+	if f.prsErr != nil {
+		return nil, f.prsErr
+	}
+	return append([]domain.PullRequest(nil), f.prs[id]...), nil
 }
 
 type fakeTracker struct {

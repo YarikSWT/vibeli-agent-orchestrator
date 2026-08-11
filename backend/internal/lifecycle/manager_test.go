@@ -2900,7 +2900,7 @@ func TestActivity_BlockedEntryAndExitEmitTelemetry(t *testing.T) {
 	}
 }
 
-func TestSCMObservation_ReadyToMergeSuppressedWhileBlocked(t *testing.T) {
+func TestSCMObservation_ReadyToMergeFiresEvenWhileBlocked(t *testing.T) {
 	st := newFakeStore()
 	sink := &fakeNotificationSink{}
 	m := New(st, nil, WithNotificationSink(sink))
@@ -2916,8 +2916,10 @@ func TestSCMObservation_ReadyToMergeSuppressedWhileBlocked(t *testing.T) {
 	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.intents) != 0 {
-		t.Fatalf("blocked session emitted ready notification: %+v", sink.intents)
+	// Same reasoning as the waiting_input case: an agent stopped on a permission
+	// prompt says nothing about whether its PR is ready for a human to merge.
+	if len(sink.intents) != 1 {
+		t.Fatalf("intents = %+v, want one ready-to-merge notification", sink.intents)
 	}
 }
 
@@ -3099,7 +3101,7 @@ func TestSCMObservation_NotReadyWhenCIOrReviewBlocks(t *testing.T) {
 	}
 }
 
-func TestSCMObservation_ReadyToMergeSuppressedWhileWaitingInput(t *testing.T) {
+func TestSCMObservation_ReadyToMergeFiresEvenWhileWaitingInput(t *testing.T) {
 	st := newFakeStore()
 	sink := &fakeNotificationSink{}
 	m := New(st, nil, WithNotificationSink(sink))
@@ -3115,8 +3117,14 @@ func TestSCMObservation_ReadyToMergeSuppressedWhileWaitingInput(t *testing.T) {
 	if err := m.ApplySCMObservation(ctx, "mer-1", obs); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.intents) != 0 {
-		t.Fatalf("waiting-input session emitted ready notification: %+v", sink.intents)
+	// An agent that just opened a PR sits at waiting_input almost by definition,
+	// so gating on activity delayed the merge ping until it happened to move on.
+	// Readiness is a fact about the PR, and only the human can act on it.
+	if len(sink.intents) != 1 {
+		t.Fatalf("intents = %+v, want one ready-to-merge notification", sink.intents)
+	}
+	if got := sink.intents[0].Type; got != domain.NotificationReadyToMerge {
+		t.Fatalf("intent type = %q, want ready_to_merge", got)
 	}
 }
 

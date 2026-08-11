@@ -414,7 +414,12 @@ func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCM
 		base.Type = domain.NotificationPRClosedUnmerged
 		return &base
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !scmObservationIsReadyToMerge(o) {
+	// Deliberately not suppressed while the agent needs input. "This PR is ready
+	// for you to merge" is a fact about the PR, and the human is the only one who
+	// can act on it either way. Suppressing it meant the ping waited for the
+	// agent to leave its prompt — measured at ~1h on a conveyor run, where an
+	// agent that just opened a PR sits at waiting_input almost by definition.
+	if rec.IsTerminated || !scmObservationIsReadyToMerge(o) {
 		return nil
 	}
 	base.Type = domain.NotificationReadyToMerge

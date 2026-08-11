@@ -2,6 +2,7 @@ package trackerintake
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -161,5 +162,93 @@ func TestClaimRefusesWhenTheIssueDoesNotExist(t *testing.T) {
 	}
 	if len(spawner.calls) != 0 {
 		t.Fatalf("an unknown issue must not start a session, spawned %d", len(spawner.calls))
+	}
+}
+
+// --- concurrency slots ------------------------------------------------------
+
+func capProject() domain.ProjectRecord {
+	project := manualProject("proj", "https://github.com/acme/demo.git")
+	project.Config.TrackerIntake.MaxConcurrent = 1
+	return project
+}
+
+func busySession() domain.SessionRecord {
+	return domain.SessionRecord{ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#1"}
+}
+
+func TestOpenPRFreesTheConcurrencySlot(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{capProject()},
+		sessions: []domain.SessionRecord{busySession()},
+		// The session opened its PR and is now waiting on a human reviewer.
+		prs: map[domain.SessionID][]domain.PullRequest{
+			"proj-1": {{URL: "https://github.com/acme/demo/pull/9", Number: 9}},
+		},
+	}
+	spawner := &fakeSpawner{}
+	observer := New(singleResolver(manualTracker()), store, spawner, Config{Logger: discardLogger()})
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spawner.calls) != 1 {
+		t.Fatalf("spawned %d sessions, want 1: a PR waiting on review must not hold the slot", len(spawner.calls))
+	}
+}
+
+func TestSessionWithoutPRStillHoldsTheSlot(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{capProject()},
+		sessions: []domain.SessionRecord{busySession()},
+	}
+	spawner := &fakeSpawner{}
+	observer := New(singleResolver(manualTracker()), store, spawner, Config{Logger: discardLogger()})
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawned %d sessions, want 0: an agent still working occupies the cap", len(spawner.calls))
+	}
+}
+
+func TestMergedPRDoesNotFreeTheSlot(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{capProject()},
+		sessions: []domain.SessionRecord{busySession()},
+		prs: map[domain.SessionID][]domain.PullRequest{
+			"proj-1": {{URL: "https://github.com/acme/demo/pull/9", Number: 9, Merged: true}},
+		},
+	}
+	spawner := &fakeSpawner{}
+	observer := New(singleResolver(manualTracker()), store, spawner, Config{Logger: discardLogger()})
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawned %d, want 0: a merged PR means teardown is imminent, not a free slot", len(spawner.calls))
+	}
+}
+
+func TestUnreadablePRsCountAgainstTheCap(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{capProject()},
+		sessions: []domain.SessionRecord{busySession()},
+		prsErr:   errors.New("db is down"),
+	}
+	spawner := &fakeSpawner{}
+	observer := New(singleResolver(manualTracker()), store, spawner, Config{Logger: discardLogger()})
+
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawned %d, want 0: over-counting only delays a claim, under-counting breaks the cap", len(spawner.calls))
 	}
 }
