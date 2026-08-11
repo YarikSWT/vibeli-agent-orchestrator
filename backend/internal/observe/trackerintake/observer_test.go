@@ -358,7 +358,19 @@ type fakeTracker struct {
 	filters      []domain.ListFilter
 }
 
-func (f *fakeTracker) Get(context.Context, domain.TrackerID) (domain.Issue, error) {
+func (f *fakeTracker) Get(_ context.Context, id domain.TrackerID) (domain.Issue, error) {
+	for _, issue := range f.issues {
+		if strings.EqualFold(issue.ID.Native, id.Native) {
+			return issue, nil
+		}
+	}
+	for _, issues := range f.issuesByRepo {
+		for _, issue := range issues {
+			if strings.EqualFold(issue.ID.Native, id.Native) {
+				return issue, nil
+			}
+		}
+	}
 	return domain.Issue{}, nil
 }
 

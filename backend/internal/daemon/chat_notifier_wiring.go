@@ -19,10 +19,11 @@ import (
 // nil, so call sites stay branch-free: the publisher is nil, Announce is a
 // no-op, and the gate still works for other pause sources.
 type chatNotifier struct {
-	client *telegram.Client
-	pub    *telegram.Publisher
-	gate   *trackerintake.Gate
-	logger *slog.Logger
+	client   *telegram.Client
+	pub      *telegram.Publisher
+	gate     *trackerintake.Gate
+	conveyor telegram.Conveyor
+	logger   *slog.Logger
 }
 
 // startChatNotifier builds the notifier from the environment and starts its
@@ -67,6 +68,41 @@ func (c *chatNotifier) intakeGate() *trackerintake.Gate {
 	return c.gate
 }
 
+// attachConveyor hands the bot the backlog surface. Intake is built after the
+// notifier (the notifier owns the pause gate intake needs), so the dependency
+// arrives in a second step rather than through the constructor.
+func (c *chatNotifier) attachConveyor(observer *trackerintake.Observer) {
+	if c == nil || observer == nil {
+		return
+	}
+	c.conveyor = intakeConveyor{observer: observer}
+}
+
+// intakeConveyor translates intake's types into the chat-facing ones.
+type intakeConveyor struct {
+	observer *trackerintake.Observer
+}
+
+func (i intakeConveyor) Queue(ctx context.Context) ([]telegram.QueueItem, error) {
+	queued, err := i.observer.Queue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]telegram.QueueItem, 0, len(queued))
+	for _, item := range queued {
+		items = append(items, telegram.QueueItem{Project: item.ProjectID, Issue: item.Issue, Title: item.Title})
+	}
+	return items, nil
+}
+
+func (i intakeConveyor) Claim(ctx context.Context, ref string) (telegram.ClaimResult, error) {
+	result, err := i.observer.Claim(ctx, ref)
+	if err != nil {
+		return telegram.ClaimResult{}, err
+	}
+	return telegram.ClaimResult{SessionID: result.SessionID, Issue: result.Issue, Title: result.Title}, nil
+}
+
 // startBot launches the command loop. It runs after the store and session
 // service exist, since /status and /kill need both. Returns nil when chat is
 // not configured, which the daemon's shutdown path treats as "nothing to wait
@@ -75,7 +111,7 @@ func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessio
 	if c == nil || c.client == nil {
 		return nil
 	}
-	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.logger)
+	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.conveyor, c.logger)
 	return bot.Start(ctx)
 }
 

@@ -43,6 +43,7 @@ func startTrackerIntake(ctx context.Context, store *sqlite.Store, sessions *sess
 		Gate:      chat.intakeGate(),
 		Announcer: chat,
 	})
+	chat.attachConveyor(intake)
 	return intake.Start(ctx), startProjectStatusSync(ctx, boards, store, sessions, logger)
 }
 

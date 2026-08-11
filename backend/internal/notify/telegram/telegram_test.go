@@ -203,9 +203,30 @@ func updateBatch(id int64, chat, text string) []byte {
 	return out
 }
 
+type fakeConveyor struct {
+	items   []QueueItem
+	claimed []string
+	err     error
+}
+
+func (f *fakeConveyor) Queue(context.Context) ([]QueueItem, error) { return f.items, f.err }
+
+func (f *fakeConveyor) Claim(_ context.Context, ref string) (ClaimResult, error) {
+	if f.err != nil {
+		return ClaimResult{}, f.err
+	}
+	f.claimed = append(f.claimed, ref)
+	return ClaimResult{SessionID: "vibeli-9", Issue: "acme/demo#" + ref, Title: "починить"}, nil
+}
+
 func runBot(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate) {
 	t.Helper()
-	bot := NewBot(newTestClient(t, api), sessions, killer, gate, discardLogger())
+	runBotWithConveyor(t, api, sessions, killer, gate, nil)
+}
+
+func runBotWithConveyor(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor) {
+	t.Helper()
+	bot := NewBot(newTestClient(t, api), sessions, killer, gate, conveyor, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := bot.Start(ctx)
 	t.Cleanup(func() {
@@ -324,5 +345,76 @@ func TestTransportErrorsNeverCarryTheToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "<token>") {
 		t.Fatalf("token should be redacted in place, got: %v", err)
+	}
+}
+
+func TestBotQueueListsBacklogInOrder(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/queue")}}
+	conveyor := &fakeConveyor{items: []QueueItem{
+		{Project: "vibeli", Issue: "acme/demo#46", Title: "SEO оптимизация"},
+		{Project: "vibeli", Issue: "acme/demo#51", Title: "действия под сообщением"},
+	}}
+	runBotWithConveyor(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, conveyor)
+
+	got := waitForMessages(t, api, 1)
+	if len(got) == 0 {
+		t.Fatal("no reply to /queue")
+	}
+	first := strings.Index(got[0], "acme/demo#46")
+	second := strings.Index(got[0], "acme/demo#51")
+	if first < 0 || second < 0 {
+		t.Fatalf("reply must list both cards:\n%s", got[0])
+	}
+	if first > second {
+		t.Fatalf("cards must keep claim order:\n%s", got[0])
+	}
+}
+
+func TestBotQueueReportsEmptyBacklog(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/queue")}}
+	runBotWithConveyor(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, &fakeConveyor{})
+
+	got := waitForMessages(t, api, 1)
+	if len(got) == 0 || !strings.Contains(got[0], "пуста") {
+		t.Fatalf("empty backlog must say so, got %#v", got)
+	}
+}
+
+func TestBotTakeClaimsTheNamedIssue(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/take 53")}}
+	conveyor := &fakeConveyor{}
+	runBotWithConveyor(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, conveyor)
+
+	got := waitForMessages(t, api, 1)
+	if len(conveyor.claimed) != 1 || conveyor.claimed[0] != "53" {
+		t.Fatalf("claimed = %v, want [53]", conveyor.claimed)
+	}
+	if len(got) == 0 || !strings.Contains(got[0], "vibeli-9") {
+		t.Fatalf("reply must name the started session, got %#v", got)
+	}
+}
+
+func TestBotTakeWithoutArgumentExplainsUsage(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "/take")}}
+	conveyor := &fakeConveyor{}
+	runBotWithConveyor(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, conveyor)
+
+	got := waitForMessages(t, api, 1)
+	if len(conveyor.claimed) != 0 {
+		t.Fatalf("nothing should be claimed without an argument: %v", conveyor.claimed)
+	}
+	if len(got) == 0 || !strings.Contains(got[0], "/take 53") {
+		t.Fatalf("reply must show the usage, got %#v", got)
+	}
+}
+
+func TestTruncateCountsRunesNotBytes(t *testing.T) {
+	// Cyrillic is 2 bytes per rune: a byte-based cut would slice a character
+	// in half and put a replacement glyph in the chat.
+	if got := truncate("почини сборку", 6); got != "почини…" {
+		t.Fatalf("truncate = %q, want почини…", got)
+	}
+	if got := truncate("короткий", 20); got != "короткий" {
+		t.Fatalf("short text must pass through unchanged, got %q", got)
 	}
 }

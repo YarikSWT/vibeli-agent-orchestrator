@@ -37,24 +37,46 @@ type Gate interface {
 	Paused() bool
 }
 
-// Bot answers control commands from the configured chat. It is deliberately
-// tiny: status, pause, resume, kill. Anything that changes code or opens a PR
-// stays in the agent's hands.
+// QueueItem is one card waiting to be claimed.
+type QueueItem struct {
+	Project string
+	Issue   string
+	Title   string
+}
+
+// ClaimResult reports the session a manual claim started.
+type ClaimResult struct {
+	SessionID string
+	Issue     string
+	Title     string
+}
+
+// Conveyor exposes the backlog to the chat: what is queued, and "start this one
+// now". It is an interface so the bot stays free of intake internals.
+type Conveyor interface {
+	Queue(ctx context.Context) ([]QueueItem, error)
+	Claim(ctx context.Context, ref string) (ClaimResult, error)
+}
+
+// Bot answers control commands from the configured chat: what is running, what
+// is queued, start this card, pause claiming, drop a session. Anything that
+// writes code or opens a PR stays in the agent's hands.
 type Bot struct {
 	client   *Client
 	sessions SessionLister
 	killer   Killer
 	gate     Gate
+	conveyor Conveyor
 	logger   *slog.Logger
 }
 
-// NewBot wires a command bot. Any of sessions/killer/gate may be nil; the
-// matching command then reports that it is unavailable instead of panicking.
-func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, logger *slog.Logger) *Bot {
+// NewBot wires a command bot. Any dependency may be nil; the matching command
+// then reports that it is unavailable instead of panicking.
+func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, logger *slog.Logger) *Bot {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, logger: logger}
+	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, conveyor: conveyor, logger: logger}
 }
 
 // Start runs the long-poll loop until ctx is done and returns a channel closed
@@ -114,8 +136,19 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		reply = b.resume()
 	case "/kill":
 		reply = b.kill(ctx, arg)
+	case "/queue":
+		reply = b.queue(ctx)
+	case "/take":
+		reply = b.take(ctx, arg)
 	case "/help", "/start":
-		reply = "/status — сессии и состояние очереди\n/pause — не брать новые карточки\n/resume — снова брать\n/kill <id> — снять сессию"
+		reply = strings.Join([]string{
+			"/status — сессии и состояние очереди",
+			"/queue — что лежит в Ready, по порядку",
+			"/take <номер> — взять конкретную задачу сейчас",
+			"/pause — не брать новые карточки",
+			"/resume — снова брать",
+			"/kill <id> — снять сессию",
+		}, "\n")
 	default:
 		return
 	}
@@ -152,6 +185,52 @@ func (b *Bot) status(ctx context.Context) string {
 		out.WriteString("живых сессий нет")
 	}
 	return strings.TrimRight(out.String(), "\n")
+}
+
+// queue shows the backlog in claim order, so /take can name a card without
+// opening the board in a browser.
+func (b *Bot) queue(ctx context.Context) string {
+	if b.conveyor == nil {
+		return "очередь недоступна"
+	}
+	items, err := b.conveyor.Queue(ctx)
+	if err != nil {
+		return "не смог прочитать очередь: " + err.Error()
+	}
+	if len(items) == 0 {
+		return "очередь пуста — в Ready ничего нет"
+	}
+	var out strings.Builder
+	out.WriteString("в очереди (в порядке, в котором будут взяты):\n")
+	for i, item := range items {
+		out.WriteString(fmt.Sprintf("%d. %s — %s\n", i+1, item.Issue, truncate(item.Title, 60)))
+	}
+	out.WriteString("\n/take <номер issue> — взять сейчас")
+	return strings.TrimRight(out.String(), "\n")
+}
+
+// take claims one specific card immediately, ahead of the queue.
+func (b *Bot) take(ctx context.Context, arg string) string {
+	ref := strings.TrimSpace(arg)
+	if ref == "" {
+		return "нужен номер issue: /take 53"
+	}
+	if b.conveyor == nil {
+		return "запуск задач недоступен"
+	}
+	result, err := b.conveyor.Claim(ctx, ref)
+	if err != nil {
+		return "не смог взять " + ref + ": " + err.Error()
+	}
+	return fmt.Sprintf("🤖 взял %s — %s\n\nсессия: %s", result.Issue, truncate(result.Title, 60), result.SessionID)
+}
+
+func truncate(text string, limit int) string {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func (b *Bot) pause() string {
