@@ -51,6 +51,13 @@ const EXTRA_CONNECT_SRC = (process.env.VITE_AO_CONNECT_SRC ?? "")
 	.map((entry) => entry.trim())
 	.filter(Boolean);
 
+// Where session preview stands are served from, e.g. "https://*.dev.vibeli.ru".
+// Empty keeps frames forbidden, which is the right default for a desktop build.
+const FRAME_SRC = (() => {
+	const configured = (process.env.VITE_AO_PREVIEW_FRAME_SRC ?? "").trim();
+	return configured ? `frame-src ${configured}` : "frame-src 'none'";
+})();
+
 // CSP for the built renderer. The daemon is loopback-only, so network access is
 // pinned to 127.0.0.1 (REST + SSE over http, terminal mux over ws). Injected at
 // build time rather than written into index.html because the dev server needs
@@ -66,7 +73,9 @@ const CONTENT_SECURITY_POLICY = [
 		.join(" "),
 	"object-src 'none'",
 	"base-uri 'self'",
-	"frame-src 'none'",
+	// Панель превью показывает стенд сессии в iframe; без явного frame-src
+	// браузер его блокирует.
+	FRAME_SRC,
 ].join("; ");
 
 const injectCspMeta: Plugin = {

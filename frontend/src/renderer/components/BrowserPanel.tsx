@@ -28,6 +28,7 @@ import {
 } from "./ui/dropdown-menu";
 import { cn } from "../lib/utils";
 import { appI18n } from "../i18n";
+import { externalPreviewUrl } from "../lib/preview-mode";
 
 type BrowserPanelProps = {
 	session: WorkspaceSession;
@@ -225,6 +226,7 @@ export function BrowserPanelView({
 	onTogglePopOut,
 	browserView,
 	annotationQueue,
+	session,
 }: BrowserPanelProps & { annotationQueue: BrowserAnnotationQueueModel; browserView: BrowserViewModel }) {
 	const { t } = useTranslation();
 	const {
@@ -251,6 +253,9 @@ export function BrowserPanelView({
 	const { beginPicking, cancelPicking, enqueue, error, failPicking, queuedCount, retryQueued, status } =
 		annotationQueue;
 	const hasNativeBrowser = Boolean(window.ao?.browser);
+	// Без Electron нативной панели нет, но стенд сессии открывается по своему
+	// внешнему адресу — показываем его вместо демонстрационной заглушки.
+	const externalUrl = externalPreviewUrl(session?.id, navState.url);
 	const showStaticPreview = !hasNativeBrowser && navState.url !== "";
 	const canAnnotate = Boolean(window.ao?.browser && viewId && navState.url);
 	const canPopOut = poppedOut || Boolean(navState.url);
@@ -550,7 +555,22 @@ export function BrowserPanelView({
 				data-testid="browser-viewport"
 			>
 				<div className="browser-panel__slot absolute inset-0 min-h-px min-w-px" ref={slotRef} />
-				{showStaticPreview ? <StaticPreview url={navState.url} /> : null}
+				{showStaticPreview ? (
+					externalUrl ? (
+						<iframe
+							key={externalUrl}
+							src={externalUrl}
+							title="Session preview"
+							data-testid="browser-preview-iframe"
+							className="absolute inset-0 h-full w-full border-0 bg-preview"
+							// Превью — это код из ветки агента: он выполняется в отдельном
+							// origin и не должен дотягиваться до самой панели.
+							sandbox="allow-scripts allow-forms allow-same-origin allow-popups"
+						/>
+					) : (
+						<StaticPreview url={navState.url} />
+					)
+				) : null}
 				{navState.url === "" ? (
 					<div className="pointer-events-none absolute inset-0 grid place-items-center p-5 text-center font-mono text-xs text-passive">
 						<p>{t("browser.emptyUrl")}</p>
