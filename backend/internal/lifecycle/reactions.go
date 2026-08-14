@@ -397,15 +397,27 @@ func (m *Manager) deliverMentions(ctx context.Context, id domain.SessionID, o po
 	}
 }
 
-// sessionIsListening reports whether the session has proven its agent is up
-// since the last (re)launch. An unreadable session is treated as listening: the
-// guard re-checks liveness immediately before writing anyway.
+// paneWarmup is how long after a (re)launch a pane is assumed to be still
+// starting when the agent has not reported in yet.
+const paneWarmup = 90 * time.Second
+
+// sessionIsListening reports whether text pasted now would reach an agent.
+//
+// FirstSignalAt alone is not the answer: it is set by the agent's hooks, and an
+// agent parked at an empty prompt emits nothing, so waiting for it would hold
+// the comment forever — precisely the session that most needs it. So a session
+// also counts as listening once its pane has had time to come up. An unreadable
+// session counts as listening too: the guard re-checks liveness immediately
+// before writing anyway.
 func (m *Manager) sessionIsListening(ctx context.Context, id domain.SessionID) bool {
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil || !ok {
 		return true
 	}
-	return !rec.FirstSignalAt.IsZero()
+	if !rec.FirstSignalAt.IsZero() {
+		return true
+	}
+	return m.clock().Sub(rec.UpdatedAt) >= paneWarmup
 }
 
 // mentionSignature ties "this comment was delivered" to the agent process that

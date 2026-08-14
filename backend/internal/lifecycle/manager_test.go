@@ -3708,9 +3708,11 @@ func TestSCMObservation_MentionIsRedeliveredAfterTheAgentRelaunches(t *testing.T
 
 func TestSCMObservation_MentionWaitsForAnAgentThatHasNotReportedIn(t *testing.T) {
 	m, st, msg := newManager()
-	// Freshly relaunched: pane exists, hooks have not proven the agent is up.
+	// Freshly relaunched a moment ago: pane exists, hooks have not proven the
+	// agent is up, and the warmup window has not passed.
 	rec := working("mer-1")
 	rec.FirstSignalAt = time.Time{}
+	rec.UpdatedAt = time.Now()
 	st.sessions["mer-1"] = rec
 	mention := ports.SCMMentionObservation{ID: "7", Author: "alice", Body: "@ao почини", CreatedAt: time.Now().UTC()}
 
@@ -3731,5 +3733,27 @@ func TestSCMObservation_MentionWaitsForAnAgentThatHasNotReportedIn(t *testing.T)
 	}
 	if len(msg.msgs) != 1 {
 		t.Fatalf("a listening agent must get the comment, got %d", len(msg.msgs))
+	}
+}
+
+func TestSCMObservation_MentionReachesASilentAgentOnceThePaneIsWarm(t *testing.T) {
+	m, st, msg := newManager()
+	// Parked at an empty prompt since a relaunch: hooks emit nothing, so
+	// FirstSignalAt stays zero no matter how long we wait.
+	rec := working("mer-1")
+	rec.FirstSignalAt = time.Time{}
+	rec.UpdatedAt = time.Now().Add(-10 * time.Minute)
+	st.sessions["mer-1"] = rec
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(
+		ports.SCMMentionObservation{ID: "7", Author: "alice", Body: "@ao почини", CreatedAt: time.Now().UTC()},
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Waiting for a signal that never comes would strand the comment in exactly
+	// the session that needs it most.
+	if len(msg.msgs) != 1 {
+		t.Fatalf("an idle-but-warm agent must get the comment, got %d", len(msg.msgs))
 	}
 }
