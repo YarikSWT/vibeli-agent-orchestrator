@@ -379,13 +379,36 @@ func (m *Manager) deliverMentions(ctx context.Context, id domain.SessionID, o po
 	// comparison needs the branch as it was at that moment.
 	before := strings.TrimSpace(o.PR.HeadSHA)
 	msg := formatMentionMessage(newest, o.PR.Number)
-	outcome, err := m.sendOnce(ctx, id, o.PR.URL, "mention:"+o.PR.URL, newest.ID, msg, 0)
+	outcome, err := m.sendOnce(ctx, id, o.PR.URL, "mention:"+o.PR.URL, m.mentionSignature(ctx, id, newest.ID), msg, 0)
 	if err != nil {
 		slog.Default().Warn("lifecycle: mention delivery failed", "session", id, "pr", o.PR.URL, "err", err)
 	}
 	if outcome == sendOnceAccounted && before != "" {
 		m.rememberMentionHandoff(ctx, o.PR.URL, before)
 	}
+}
+
+// mentionSignature ties "this comment was delivered" to the agent process that
+// received it, not just to the comment.
+//
+// A pasted message lives in one terminal pane and nowhere else. Restart the
+// daemon and the pane is recreated: the text is gone, but the dedup record
+// survives in the database, so the comment counts as delivered and is never
+// repeated — the operator sees an agent that ignored them. Folding the runtime
+// launch id into the signature means a relaunched agent is handed the comment
+// again, and a running one still gets it exactly once.
+func (m *Manager) mentionSignature(ctx context.Context, id domain.SessionID, commentID string) string {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		// Without the epoch the comment can only be over-delivered after a
+		// restart, which is the harmless direction.
+		return commentID
+	}
+	launch := strings.TrimSpace(rec.Metadata.RuntimeLaunchID)
+	if launch == "" {
+		return commentID
+	}
+	return commentID + "@" + launch
 }
 
 // mentionHandoffKey marks a PR whose agent was handed a comment and has not

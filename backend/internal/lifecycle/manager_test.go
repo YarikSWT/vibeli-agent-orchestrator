@@ -3669,3 +3669,39 @@ func TestSCMObservation_PushWithoutAMentionIsNotAnnounced(t *testing.T) {
 		t.Fatalf("a push nobody asked for is not an answer: %v", announcer.texts)
 	}
 }
+
+func TestSCMObservation_MentionIsRedeliveredAfterTheAgentRelaunches(t *testing.T) {
+	m, st, msg := newManager()
+	rec := working("mer-1")
+	rec.Metadata.RuntimeLaunchID = "launch-1"
+	st.sessions["mer-1"] = rec
+	mention := ports.SCMMentionObservation{ID: "7", Author: "alice", Body: "@ao почини", CreatedAt: time.Now().UTC()}
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("first delivery: got %d messages, want 1", len(msg.msgs))
+	}
+
+	// Same agent process: re-reading the timeline must not repeat it.
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("same launch re-delivered: %v", msg.msgs)
+	}
+
+	// The daemon restarted: the pane holding that text is gone, so the comment
+	// has to be handed to the new agent process.
+	relaunched := st.sessions["mer-1"]
+	relaunched.Metadata.RuntimeLaunchID = "launch-2"
+	st.sessions["mer-1"] = relaunched
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 2 {
+		t.Fatalf("a relaunched agent must be handed the comment again, got %d messages", len(msg.msgs))
+	}
+}
