@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	scmgithub "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/github"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
@@ -32,6 +33,9 @@ func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.M
 		IdentityResolver: provider,
 		// Тот же чат-канал, что у intake: сообщить, что агент замер с недоделанной работой.
 		Announcer: announcer,
+		// Порог простоя настраивается: на отладке его снижают до минут, в проде
+		// длинный порог бережёт внимание оператора.
+		StallAfter: stallAfterFromEnv(logger),
 		// Дежурный агент проекта: разбирает зависшую сессию до того, как это
 		// придётся делать человеку.
 		Escalator: escalator,
@@ -74,4 +78,22 @@ func closedDone() <-chan struct{} {
 	done := make(chan struct{})
 	close(done)
 	return done
+}
+
+// stallAfterFromEnv reads AO_STALL_AFTER, the idle span after which a session
+// with unfinished work is reported. Empty keeps the observer default; a
+// negative value disables the report entirely. Tuning it without a rebuild
+// matters because the right threshold is a matter of taste — long enough not to
+// nag, short enough to catch an agent that quietly gave up.
+func stallAfterFromEnv(logger *slog.Logger) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("AO_STALL_AFTER"))
+	if raw == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		logger.Warn("AO_STALL_AFTER is not a duration, using the default", "value", raw, "err", err)
+		return 0
+	}
+	return d
 }
