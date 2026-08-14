@@ -341,7 +341,7 @@ func newManager() (*Manager, *fakeStore, *fakeMessenger) {
 }
 
 func working(id domain.SessionID) domain.SessionRecord {
-	return domain.SessionRecord{ID: id, ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: time.Now()}, AutoInjectReview: true}
+	return domain.SessionRecord{ID: id, ProjectID: "mer", Activity: domain.Activity{State: domain.ActivityActive, LastActivityAt: time.Now()}, FirstSignalAt: time.Now(), AutoInjectReview: true}
 }
 
 func TestRuntimeObservation_ConfirmedRuntimeDeathTerminates(t *testing.T) {
@@ -3703,5 +3703,33 @@ func TestSCMObservation_MentionIsRedeliveredAfterTheAgentRelaunches(t *testing.T
 	}
 	if len(msg.msgs) != 2 {
 		t.Fatalf("a relaunched agent must be handed the comment again, got %d messages", len(msg.msgs))
+	}
+}
+
+func TestSCMObservation_MentionWaitsForAnAgentThatHasNotReportedIn(t *testing.T) {
+	m, st, msg := newManager()
+	// Freshly relaunched: pane exists, hooks have not proven the agent is up.
+	rec := working("mer-1")
+	rec.FirstSignalAt = time.Time{}
+	st.sessions["mer-1"] = rec
+	mention := ports.SCMMentionObservation{ID: "7", Author: "alice", Body: "@ao почини", CreatedAt: time.Now().UTC()}
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 0 {
+		t.Fatalf("pasting into a starting TUI loses the text: %v", msg.msgs)
+	}
+
+	// Once the agent reports in, the same comment is delivered.
+	ready := st.sessions["mer-1"]
+	ready.FirstSignalAt = time.Now()
+	st.sessions["mer-1"] = ready
+
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservation(mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(msg.msgs) != 1 {
+		t.Fatalf("a listening agent must get the comment, got %d", len(msg.msgs))
 	}
 }

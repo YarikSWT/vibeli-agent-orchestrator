@@ -374,6 +374,15 @@ func (m *Manager) deliverMentions(ctx context.Context, id domain.SessionID, o po
 	if !ok {
 		return
 	}
+	// A freshly relaunched agent has a pane but is not reading it yet: the TUI
+	// is still starting, and text pasted now lands nowhere while the dedup
+	// record marks the comment delivered. FirstSignalAt is the session's own
+	// proof that its hook pipeline works, so it is the earliest moment the
+	// paste can be trusted. Waiting costs one poll; not waiting costs the
+	// comment.
+	if !m.sessionIsListening(ctx, id) {
+		return
+	}
 	// Head SHA is recorded before the send: the answer to "did the agent act on
 	// this comment?" is "the branch moved since we handed it over", and the
 	// comparison needs the branch as it was at that moment.
@@ -386,6 +395,17 @@ func (m *Manager) deliverMentions(ctx context.Context, id domain.SessionID, o po
 	if outcome == sendOnceAccounted && before != "" {
 		m.rememberMentionHandoff(ctx, o.PR.URL, before)
 	}
+}
+
+// sessionIsListening reports whether the session has proven its agent is up
+// since the last (re)launch. An unreadable session is treated as listening: the
+// guard re-checks liveness immediately before writing anyway.
+func (m *Manager) sessionIsListening(ctx context.Context, id domain.SessionID) bool {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil || !ok {
+		return true
+	}
+	return !rec.FirstSignalAt.IsZero()
 }
 
 // mentionSignature ties "this comment was delivered" to the agent process that
