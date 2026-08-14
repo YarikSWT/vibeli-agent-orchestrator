@@ -67,6 +67,13 @@ type Announcer interface {
 	Announce(text string)
 }
 
+// Escalator hands a stalled session to the project's orchestrator — the agent
+// on duty — so a human is not the only one who can look at it. Optional: nil
+// means stalls are only announced to the chat.
+type Escalator interface {
+	Escalate(ctx context.Context, project domain.ProjectID, stalled domain.SessionID, text string)
+}
+
 // Store is the persistence contract the observer needs for discovery, local
 // hash reads, and transactional SCM writes.
 type Store interface {
@@ -103,6 +110,9 @@ type Config struct {
 	// Announcer reports human-facing events. Optional: nil keeps the observer
 	// silent, which is the desktop default.
 	Announcer Announcer
+	// Escalator forwards the same stall to the project's orchestrator session.
+	// Optional: without one, only the chat hears about it.
+	Escalator Escalator
 	// StallAfter is how long a live session may sit idle with unfinished work
 	// before it is reported. Zero uses DefaultStallAfter; negative disables.
 	StallAfter time.Duration
@@ -181,6 +191,8 @@ type Observer struct {
 	tick time.Duration
 	// announcer reports stalled sessions; nil disables the report.
 	announcer Announcer
+	// escalator hands the stall to the orchestrator on duty; nil disables it.
+	escalator Escalator
 	// stallAfter is the idle span that counts as stalled; zero disables.
 	stallAfter time.Duration
 	// stalled remembers which sessions were already reported, so one stall is
@@ -208,7 +220,7 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, identityResolver: cfg.IdentityResolver, webBaseURL: strings.TrimRight(strings.TrimSpace(cfg.WebBaseURL), "/"), announcer: cfg.Announcer, stallAfter: cfg.StallAfter, stalled: map[domain.SessionID]time.Time{}, Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, identityResolver: cfg.IdentityResolver, webBaseURL: strings.TrimRight(strings.TrimSpace(cfg.WebBaseURL), "/"), announcer: cfg.Announcer, escalator: cfg.Escalator, stallAfter: cfg.StallAfter, stalled: map[domain.SessionID]time.Time{}, Cache: newCache(cfg.CacheMax)}
 	if o.stallAfter == 0 {
 		o.stallAfter = DefaultStallAfter
 	}
@@ -393,7 +405,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now)
 	o.refreshMentions(ctx, subjects, observations, selection.subjectsByPR, localOnlyObservations, now)
 	o.stampSessionLinks(ctx, subjects)
-	o.reportStalledSessions(subjects, now)
+	o.reportStalledSessions(ctx, subjects, now)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1131,8 +1143,8 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 // wrong. What deserves a ping is an agent that has no PR yet, or whose PR is
 // blocked (conflict, red CI, changes requested) — there the work is its own and
 // it simply stopped.
-func (o *Observer) reportStalledSessions(subjects map[string]*subject, now time.Time) {
-	if o.announcer == nil || o.stallAfter < 0 {
+func (o *Observer) reportStalledSessions(ctx context.Context, subjects map[string]*subject, now time.Time) {
+	if (o.announcer == nil && o.escalator == nil) || o.stallAfter < 0 {
 		return
 	}
 	seen := map[domain.SessionID]bool{}
@@ -1168,10 +1180,17 @@ func (o *Observer) reportStalledSessions(subjects map[string]*subject, now time.
 		if o.webBaseURL != "" && session.ProjectID != "" {
 			link = fmt.Sprintf("\n%s/#/projects/%s/sessions/%s", o.webBaseURL, session.ProjectID, session.ID)
 		}
-		o.announcer.Announce(fmt.Sprintf(
-			"😴 Агент простаивает %d мин, а работа не доведена\n\nСессия: %s\n%s%s\n\nПодтолкнуть: /kill %s или напиши ему в сессии",
-			int(idleFor.Minutes()), session.ID, what, link, session.ID,
-		))
+		if o.escalator != nil {
+			o.escalator.Escalate(ctx, session.ProjectID, session.ID,
+				fmt.Sprintf("Сессия %s простаивает %d мин, работа не доведена: %s. Разберись, что произошло, и доложи.",
+					session.ID, int(idleFor.Minutes()), what))
+		}
+		if o.announcer != nil {
+			o.announcer.Announce(fmt.Sprintf(
+				"😴 Агент простаивает %d мин, а работа не доведена\n\nСессия: %s\n%s%s\n\nПодтолкнуть: /kill %s или напиши ему в сессии",
+				int(idleFor.Minutes()), session.ID, what, link, session.ID,
+			))
+		}
 		o.logger.Info("scm observer: stalled session reported", "session", session.ID, "idle", idleFor.String())
 	}
 	for id := range o.stalled {

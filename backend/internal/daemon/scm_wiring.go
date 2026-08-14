@@ -21,7 +21,7 @@ import (
 // provider used by v1. Missing credentials do not fail daemon startup; the
 // observer performs a lazy credential check in its background goroutine, logs
 // one warning, and disables itself before any provider API calls.
-func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, announcer scmobserve.Announcer, logger *slog.Logger) <-chan struct{} {
+func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, announcer scmobserve.Announcer, escalator scmobserve.Escalator, logger *slog.Logger) <-chan struct{} {
 	provider, err := newGitHubSCMProvider(logger)
 	if err != nil {
 		logSCMProviderDisabled(logger, err)
@@ -32,6 +32,9 @@ func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.M
 		IdentityResolver: provider,
 		// Тот же чат-канал, что у intake: сообщить, что агент замер с недоделанной работой.
 		Announcer: announcer,
+		// Дежурный агент проекта: разбирает зависшую сессию до того, как это
+		// придётся делать человеку.
+		Escalator: escalator,
 		// Where this daemon's web UI answers. Set it and every PR gets a link
 		// back to the session that produced it; leave it empty and nothing is
 		// written into PR descriptions.

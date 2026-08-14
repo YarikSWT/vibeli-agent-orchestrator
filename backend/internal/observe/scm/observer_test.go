@@ -1878,7 +1878,7 @@ func TestStall_ReportsAnAgentThatStoppedBeforeOpeningAPR(t *testing.T) {
 	announcer := &fakeAnnouncer{}
 	o := stallObserver(announcer)
 
-	o.reportStalledSessions(map[string]*subject{
+	o.reportStalledSessions(context.Background(), map[string]*subject{
 		"k": stallSubject("vibeli-16", 90*time.Minute, now, domain.PullRequest{}, false),
 	}, now)
 
@@ -1900,7 +1900,7 @@ func TestStall_CleanPRWaitingOnAHumanIsNotAStall(t *testing.T) {
 	// Green, mergeable, waiting for a reviewer: idle here is correct behaviour
 	// and may last for days.
 	ready := domain.PullRequest{Number: 80, CI: domain.CIPassing, Mergeability: domain.MergeMergeable}
-	o.reportStalledSessions(map[string]*subject{
+	o.reportStalledSessions(context.Background(), map[string]*subject{
 		"k": stallSubject("vibeli-16", 5*time.Hour, now, ready, true),
 	}, now)
 
@@ -1915,7 +1915,7 @@ func TestStall_BlockedPRIsReportedWithItsReason(t *testing.T) {
 	o := stallObserver(announcer)
 
 	conflicted := domain.PullRequest{Number: 113, CI: domain.CIPassing, Mergeability: domain.MergeConflicting}
-	o.reportStalledSessions(map[string]*subject{
+	o.reportStalledSessions(context.Background(), map[string]*subject{
 		"k": stallSubject("vibeli-16", 45*time.Minute, now, conflicted, true),
 	}, now)
 
@@ -1931,7 +1931,7 @@ func TestStall_IsAnnouncedOncePerStall(t *testing.T) {
 	subjects := map[string]*subject{"k": stallSubject("vibeli-16", 90*time.Minute, now, domain.PullRequest{}, false)}
 
 	for range 3 {
-		o.reportStalledSessions(subjects, now)
+		o.reportStalledSessions(context.Background(), subjects, now)
 	}
 	if len(announcer.texts) != 1 {
 		t.Fatalf("polling every 30s must not repeat the report: %d sent", len(announcer.texts))
@@ -1939,9 +1939,9 @@ func TestStall_IsAnnouncedOncePerStall(t *testing.T) {
 
 	// The agent moves, then stalls again: that is a new stall and is reported.
 	moved := map[string]*subject{"k": stallSubject("vibeli-16", time.Minute, now, domain.PullRequest{}, false)}
-	o.reportStalledSessions(moved, now)
+	o.reportStalledSessions(context.Background(), moved, now)
 	stalledAgain := map[string]*subject{"k": stallSubject("vibeli-16", 90*time.Minute, now.Add(time.Hour), domain.PullRequest{}, false)}
-	o.reportStalledSessions(stalledAgain, now.Add(time.Hour))
+	o.reportStalledSessions(context.Background(), stalledAgain, now.Add(time.Hour))
 	if len(announcer.texts) != 2 {
 		t.Fatalf("a fresh stall after activity should be reported: %d sent", len(announcer.texts))
 	}
@@ -1952,7 +1952,7 @@ func TestStall_ActiveSessionIsNotReported(t *testing.T) {
 	announcer := &fakeAnnouncer{}
 	o := stallObserver(announcer)
 
-	o.reportStalledSessions(map[string]*subject{
+	o.reportStalledSessions(context.Background(), map[string]*subject{
 		"k": stallSubject("vibeli-16", 2*time.Minute, now, domain.PullRequest{}, false),
 	}, now)
 
