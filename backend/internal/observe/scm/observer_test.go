@@ -1849,3 +1849,114 @@ func TestPoll_SessionLinkFailureDoesNotFailThePoll(t *testing.T) {
 		t.Fatal("PR facts should still reach lifecycle")
 	}
 }
+
+type fakeAnnouncer struct{ texts []string }
+
+func (f *fakeAnnouncer) Announce(text string) { f.texts = append(f.texts, text) }
+
+func stallSubject(id domain.SessionID, idleFor time.Duration, now time.Time, pr domain.PullRequest, hasPR bool) *subject {
+	return &subject{
+		session: domain.SessionRecord{
+			ID: id, ProjectID: "vibeli",
+			Activity: domain.Activity{State: domain.ActivityIdle, LastActivityAt: now.Add(-idleFor)},
+		},
+		repo:  testRepo,
+		known: pr,
+		hasPR: hasPR,
+	}
+}
+
+func stallObserver(announcer Announcer) *Observer {
+	return New(&fakeProvider{}, &fakeStore{}, &fakeLifecycle{}, Config{
+		Logger: quietSlog(), CacheMax: 32, Announcer: announcer,
+		StallAfter: 30 * time.Minute, WebBaseURL: "https://ao-web.example.com",
+	})
+}
+
+func TestStall_ReportsAnAgentThatStoppedBeforeOpeningAPR(t *testing.T) {
+	now := time.Now().UTC()
+	announcer := &fakeAnnouncer{}
+	o := stallObserver(announcer)
+
+	o.reportStalledSessions(map[string]*subject{
+		"k": stallSubject("vibeli-16", 90*time.Minute, now, domain.PullRequest{}, false),
+	}, now)
+
+	if len(announcer.texts) != 1 {
+		t.Fatalf("announcements = %v, want one", announcer.texts)
+	}
+	for _, want := range []string{"vibeli-16", "PR ещё не открыт", "ao-web.example.com"} {
+		if !strings.Contains(announcer.texts[0], want) {
+			t.Errorf("report missing %q:\n%s", want, announcer.texts[0])
+		}
+	}
+}
+
+func TestStall_CleanPRWaitingOnAHumanIsNotAStall(t *testing.T) {
+	now := time.Now().UTC()
+	announcer := &fakeAnnouncer{}
+	o := stallObserver(announcer)
+
+	// Green, mergeable, waiting for a reviewer: idle here is correct behaviour
+	// and may last for days.
+	ready := domain.PullRequest{Number: 80, CI: domain.CIPassing, Mergeability: domain.MergeMergeable}
+	o.reportStalledSessions(map[string]*subject{
+		"k": stallSubject("vibeli-16", 5*time.Hour, now, ready, true),
+	}, now)
+
+	if len(announcer.texts) != 0 {
+		t.Fatalf("a PR waiting on review must not be reported: %v", announcer.texts)
+	}
+}
+
+func TestStall_BlockedPRIsReportedWithItsReason(t *testing.T) {
+	now := time.Now().UTC()
+	announcer := &fakeAnnouncer{}
+	o := stallObserver(announcer)
+
+	conflicted := domain.PullRequest{Number: 113, CI: domain.CIPassing, Mergeability: domain.MergeConflicting}
+	o.reportStalledSessions(map[string]*subject{
+		"k": stallSubject("vibeli-16", 45*time.Minute, now, conflicted, true),
+	}, now)
+
+	if len(announcer.texts) != 1 || !strings.Contains(announcer.texts[0], "конфликт") {
+		t.Fatalf("report should name the blocker: %v", announcer.texts)
+	}
+}
+
+func TestStall_IsAnnouncedOncePerStall(t *testing.T) {
+	now := time.Now().UTC()
+	announcer := &fakeAnnouncer{}
+	o := stallObserver(announcer)
+	subjects := map[string]*subject{"k": stallSubject("vibeli-16", 90*time.Minute, now, domain.PullRequest{}, false)}
+
+	for range 3 {
+		o.reportStalledSessions(subjects, now)
+	}
+	if len(announcer.texts) != 1 {
+		t.Fatalf("polling every 30s must not repeat the report: %d sent", len(announcer.texts))
+	}
+
+	// The agent moves, then stalls again: that is a new stall and is reported.
+	moved := map[string]*subject{"k": stallSubject("vibeli-16", time.Minute, now, domain.PullRequest{}, false)}
+	o.reportStalledSessions(moved, now)
+	stalledAgain := map[string]*subject{"k": stallSubject("vibeli-16", 90*time.Minute, now.Add(time.Hour), domain.PullRequest{}, false)}
+	o.reportStalledSessions(stalledAgain, now.Add(time.Hour))
+	if len(announcer.texts) != 2 {
+		t.Fatalf("a fresh stall after activity should be reported: %d sent", len(announcer.texts))
+	}
+}
+
+func TestStall_ActiveSessionIsNotReported(t *testing.T) {
+	now := time.Now().UTC()
+	announcer := &fakeAnnouncer{}
+	o := stallObserver(announcer)
+
+	o.reportStalledSessions(map[string]*subject{
+		"k": stallSubject("vibeli-16", 2*time.Minute, now, domain.PullRequest{}, false),
+	}, now)
+
+	if len(announcer.texts) != 0 {
+		t.Fatalf("an agent that just worked is not stalled: %v", announcer.texts)
+	}
+}

@@ -183,7 +183,7 @@ func Run() error {
 		return fmt.Errorf("wire agent resolver: %w", err)
 	}
 
-	lcStack := startLifecycle(ctx, store, runtimeAdapter, lifecycleMessenger, notificationWriter, telemetrySink, agents, log)
+	lcStack := startLifecycle(ctx, store, runtimeAdapter, lifecycleMessenger, notificationWriter, chatNotifier, telemetrySink, agents, log)
 
 	// Wire the controller-facing session service over the same store + LCM, the
 	// selected runtime, routed git/scratch workspaces, the per-session agent
@@ -329,7 +329,7 @@ func Run() error {
 		})
 		lcStack.LCM.SetUsageFinalizer(usageCollector)
 	}
-	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, log)
+	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, chatNotifier, log)
 	var prActions prsvc.ActionManager
 	if mergeProvider, mergeErr := newGitHubSCMProvider(log); mergeErr != nil {
 		logSCMProviderDisabled(log, mergeErr)

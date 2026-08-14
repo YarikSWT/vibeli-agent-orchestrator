@@ -138,6 +138,18 @@ func WithContainerReaper(reaper ports.ContainerReaper, projects projectConfigLoa
 // WithActiveSteering supplies the adapter-provided active-turn steering
 // capability (see ports.ActiveTurnSteerer). Without it the reducer assumes no
 // harness can be steered mid-turn.
+// Announcer receives human-facing conveyor events. Optional: without one the
+// manager stays silent, which is the desktop default.
+type Announcer interface {
+	Announce(text string)
+}
+
+// WithAnnouncer wires the chat side-channel used to report that an agent acted
+// on a review comment.
+func WithAnnouncer(a Announcer) Option {
+	return func(m *Manager) { m.announcer = a }
+}
+
 func WithActiveSteering(pred func(domain.AgentHarness) bool) Option {
 	return func(m *Manager) {
 		if pred != nil {
@@ -155,6 +167,9 @@ type Manager struct {
 	// nudges become no-ops but the reducer still runs.
 	guard         *sessionguard.Guard
 	notifications notificationSink
+	// announcer reports human-facing events (an agent acted on a review
+	// comment); nil means nothing is sent.
+	announcer Announcer
 	// completionTerminator is late-bound because Session Manager itself depends
 	// on this lifecycle reducer. It is required before the SCM observer starts.
 	completionTerminator sessionTerminator

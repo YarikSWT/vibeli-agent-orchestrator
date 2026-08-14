@@ -3593,3 +3593,79 @@ func TestSCMObservation_NoMentionsSendsNothing(t *testing.T) {
 		t.Fatalf("a PR with no mentions must not nudge the agent: %v", msg.msgs)
 	}
 }
+
+type fakeAnnouncer struct{ texts []string }
+
+func (f *fakeAnnouncer) Announce(text string) { f.texts = append(f.texts, text) }
+
+// mentionObservationAt is mentionObservation with an explicit branch tip, so a
+// test can move the branch between polls.
+func mentionObservationAt(head string, mentions ...ports.SCMMentionObservation) ports.SCMObservation {
+	obs := mentionObservation(mentions...)
+	obs.PR.HeadSHA = head
+	obs.PR.Title = "почини кнопку"
+	return obs
+}
+
+func TestSCMObservation_AnnouncesWhenAgentPushesAfterAMention(t *testing.T) {
+	m, st, _ := newManager()
+	announcer := &fakeAnnouncer{}
+	m.announcer = announcer
+	st.sessions["mer-1"] = working("mer-1")
+	mention := ports.SCMMentionObservation{ID: "7", Author: "alice", Body: "@ao почини", CreatedAt: time.Now().UTC()}
+
+	// Comment handed over while the branch sits at sha-old.
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservationAt("sha-old-1111", mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(announcer.texts) != 0 {
+		t.Fatalf("nothing to announce until the agent pushes: %v", announcer.texts)
+	}
+
+	// Same branch on the next poll: still no answer.
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservationAt("sha-old-1111", mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(announcer.texts) != 0 {
+		t.Fatalf("an unchanged branch is not an answer: %v", announcer.texts)
+	}
+
+	// Branch moved — that is the evidence the agent acted.
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservationAt("sha-new-2222", mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(announcer.texts) != 1 {
+		t.Fatalf("announcements = %v, want exactly one", announcer.texts)
+	}
+	for _, want := range []string{"#80", "почини кнопку", "sha-new-"} {
+		if !strings.Contains(announcer.texts[0], want) {
+			t.Errorf("announcement missing %q:\n%s", want, announcer.texts[0])
+		}
+	}
+
+	// And it is said once, not on every later poll.
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservationAt("sha-new-2222", mention)); err != nil {
+		t.Fatal(err)
+	}
+	if len(announcer.texts) != 1 {
+		t.Fatalf("announced again on a later poll: %v", announcer.texts)
+	}
+}
+
+func TestSCMObservation_PushWithoutAMentionIsNotAnnounced(t *testing.T) {
+	m, st, _ := newManager()
+	announcer := &fakeAnnouncer{}
+	m.announcer = announcer
+	st.sessions["mer-1"] = working("mer-1")
+
+	// Ordinary work on a PR nobody commented on.
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservationAt("sha-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplySCMObservation(ctx, "mer-1", mentionObservationAt("sha-b")); err != nil {
+		t.Fatal(err)
+	}
+	if len(announcer.texts) != 0 {
+		t.Fatalf("a push nobody asked for is not an answer: %v", announcer.texts)
+	}
+}

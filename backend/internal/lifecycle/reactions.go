@@ -357,6 +357,7 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	}
 	m.emitNotification(ctx, intent)
 	m.resolveNotifications(ctx, readyToMergeResolutions(id, o, m.clock())...)
+	m.announceMentionAnswered(ctx, o)
 	m.deliverMentions(ctx, id, o)
 	return nil
 }
@@ -373,10 +374,83 @@ func (m *Manager) deliverMentions(ctx context.Context, id domain.SessionID, o po
 	if !ok {
 		return
 	}
+	// Head SHA is recorded before the send: the answer to "did the agent act on
+	// this comment?" is "the branch moved since we handed it over", and the
+	// comparison needs the branch as it was at that moment.
+	before := strings.TrimSpace(o.PR.HeadSHA)
 	msg := formatMentionMessage(newest, o.PR.Number)
-	if _, err := m.sendOnce(ctx, id, o.PR.URL, "mention:"+o.PR.URL, newest.ID, msg, 0); err != nil {
+	outcome, err := m.sendOnce(ctx, id, o.PR.URL, "mention:"+o.PR.URL, newest.ID, msg, 0)
+	if err != nil {
 		slog.Default().Warn("lifecycle: mention delivery failed", "session", id, "pr", o.PR.URL, "err", err)
 	}
+	if outcome == sendOnceAccounted && before != "" {
+		m.rememberMentionHandoff(ctx, o.PR.URL, before)
+	}
+}
+
+// mentionHandoffKey marks a PR whose agent was handed a comment and has not
+// pushed since. The value is the head SHA at handover.
+func mentionHandoffKey(prURL string) string { return "mention-head:" + prURL }
+
+// rememberMentionHandoff records the branch tip a mention was delivered against.
+// It reuses the reaction-dedup payload so the fact survives a daemon restart:
+// an unanswered comment must not be silently forgotten on redeploy.
+func (m *Manager) rememberMentionHandoff(ctx context.Context, prURL, headSHA string) {
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+	key := mentionHandoffKey(prURL)
+	if m.react.seen[key] == headSHA {
+		return
+	}
+	m.react.seen[key] = headSHA
+	if err := m.persistPRSignaturesLocked(ctx, prURL); err != nil {
+		slog.Default().Warn("lifecycle: could not record mention handoff", "pr", prURL, "err", err)
+	}
+}
+
+// announceMentionAnswered reports that the branch moved after a comment was
+// handed to the agent, and clears the marker so one answer is announced once.
+//
+// The push is the evidence: an agent can reply in the terminal and change
+// nothing, and it can also fix the code without saying a word. Only the commit
+// tells a human something is ready to look at again.
+func (m *Manager) announceMentionAnswered(ctx context.Context, o ports.SCMObservation) {
+	if m.announcer == nil {
+		return
+	}
+	prURL := strings.TrimSpace(o.PR.URL)
+	head := strings.TrimSpace(o.PR.HeadSHA)
+	if prURL == "" || head == "" {
+		return
+	}
+	m.react.mu.Lock()
+	handedOver, ok := m.react.seen[mentionHandoffKey(prURL)]
+	if !ok || handedOver == head {
+		m.react.mu.Unlock()
+		return
+	}
+	delete(m.react.seen, mentionHandoffKey(prURL))
+	err := m.persistPRSignaturesLocked(ctx, prURL)
+	m.react.mu.Unlock()
+	if err != nil {
+		slog.Default().Warn("lifecycle: could not clear mention handoff", "pr", prURL, "err", err)
+	}
+
+	title := strings.TrimSpace(o.PR.Title)
+	if title == "" {
+		title = prURL
+	}
+	m.announcer.Announce(fmt.Sprintf(
+		"✍️ Агент ответил на комментарий\n\nPR #%d — %s\nНовый коммит: %s\n%s",
+		o.PR.Number, domain.SanitizeControlChars(title), shortSHA(head), prURL,
+	))
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // newestMention picks the most recent comment; ties fall back to the later id,

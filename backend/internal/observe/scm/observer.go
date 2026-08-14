@@ -27,6 +27,11 @@ import (
 const (
 	// DefaultTickInterval is the SCM observer's PR/CI polling cadence.
 	DefaultTickInterval = 30 * time.Second
+	// DefaultStallAfter is how long a session may sit idle with work still open
+	// before the operator hears about it. Agents stop mid-task for dull reasons
+	// — a context compaction that loses the thread, a spent usage window — and
+	// nothing else notices: the session stays "live" and simply does nothing.
+	DefaultStallAfter = 30 * time.Minute
 	// DefaultReviewInterval is the minimum interval between review-thread polls
 	// for a PR whose review state warrants thread refresh.
 	DefaultReviewInterval = 2 * time.Minute
@@ -54,6 +59,12 @@ type Provider interface {
 	FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error)
 	FetchMentions(ctx context.Context, ref ports.SCMPRRef) ([]ports.SCMMentionObservation, error)
 	EnsurePRBodyBlock(ctx context.Context, ref ports.SCMPRRef, marker, block string) (bool, error)
+}
+
+// Announcer receives human-facing events, such as an agent that stopped
+// mid-task. It is the same chat side-channel intake and lifecycle use.
+type Announcer interface {
+	Announce(text string)
 }
 
 // Store is the persistence contract the observer needs for discovery, local
@@ -89,6 +100,12 @@ type Config struct {
 	Logger *slog.Logger
 	// CacheMax bounds each in-memory ETag/review cache. Zero uses DefaultCacheMax.
 	CacheMax int
+	// Announcer reports human-facing events. Optional: nil keeps the observer
+	// silent, which is the desktop default.
+	Announcer Announcer
+	// StallAfter is how long a live session may sit idle with unfinished work
+	// before it is reported. Zero uses DefaultStallAfter; negative disables.
+	StallAfter time.Duration
 	// WebBaseURL is the origin the AO web UI is served from. When set, the
 	// observer stamps a link to the owning session into each PR description.
 	// Empty disables the stamp, which is the right default for a desktop install
@@ -162,6 +179,13 @@ type Observer struct {
 	lifecycle Lifecycle
 	// tick is the active PR/CI polling cadence.
 	tick time.Duration
+	// announcer reports stalled sessions; nil disables the report.
+	announcer Announcer
+	// stallAfter is the idle span that counts as stalled; zero disables.
+	stallAfter time.Duration
+	// stalled remembers which sessions were already reported, so one stall is
+	// announced once and re-arms only after the agent moves again.
+	stalled map[domain.SessionID]time.Time
 	// webBaseURL is the origin of the AO web UI, used to link a PR back to its
 	// session. Empty disables the stamp.
 	webBaseURL string
@@ -184,7 +208,10 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, identityResolver: cfg.IdentityResolver, webBaseURL: strings.TrimRight(strings.TrimSpace(cfg.WebBaseURL), "/"), Cache: newCache(cfg.CacheMax)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, identityResolver: cfg.IdentityResolver, webBaseURL: strings.TrimRight(strings.TrimSpace(cfg.WebBaseURL), "/"), announcer: cfg.Announcer, stallAfter: cfg.StallAfter, stalled: map[domain.SessionID]time.Time{}, Cache: newCache(cfg.CacheMax)}
+	if o.stallAfter == 0 {
+		o.stallAfter = DefaultStallAfter
+	}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -366,6 +393,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	o.refreshReviews(ctx, subjects, observations, selection.subjectsByPR, reviewModes, localOnlyObservations, reviewStale, now)
 	o.refreshMentions(ctx, subjects, observations, selection.subjectsByPR, localOnlyObservations, now)
 	o.stampSessionLinks(ctx, subjects)
+	o.reportStalledSessions(subjects, now)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1093,6 +1121,103 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		}
 		cacheDelete(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey)
 	}
+}
+
+// reportStalledSessions tells the operator about agents that stopped with work
+// unfinished.
+//
+// "Unfinished" is deliberately narrow: a session whose PR is open and clean is
+// waiting on a human reviewer and may sit idle for days without anything being
+// wrong. What deserves a ping is an agent that has no PR yet, or whose PR is
+// blocked (conflict, red CI, changes requested) — there the work is its own and
+// it simply stopped.
+func (o *Observer) reportStalledSessions(subjects map[string]*subject, now time.Time) {
+	if o.announcer == nil || o.stallAfter < 0 {
+		return
+	}
+	seen := map[domain.SessionID]bool{}
+	for _, s := range subjects {
+		session := s.session
+		if session.ID == "" || session.IsTerminated {
+			continue
+		}
+		seen[session.ID] = true
+
+		last := session.Activity.LastActivityAt
+		idleFor := now.Sub(last)
+		if last.IsZero() || idleFor < o.stallAfter {
+			// Moving again re-arms the report for the next stall.
+			delete(o.stalled, session.ID)
+			continue
+		}
+		if !sessionWorkIsUnfinished(s) {
+			continue
+		}
+		// Already reported at this activity timestamp: the agent has not moved
+		// since, so there is nothing new to say.
+		if reported, ok := o.stalled[session.ID]; ok && reported.Equal(last) {
+			continue
+		}
+		o.stalled[session.ID] = last
+
+		what := "PR ещё не открыт"
+		if s.hasPR && s.known.Number > 0 {
+			what = fmt.Sprintf("PR #%d ждёт доработки (%s)", s.known.Number, stallReason(s.known))
+		}
+		link := ""
+		if o.webBaseURL != "" && session.ProjectID != "" {
+			link = fmt.Sprintf("\n%s/#/projects/%s/sessions/%s", o.webBaseURL, session.ProjectID, session.ID)
+		}
+		o.announcer.Announce(fmt.Sprintf(
+			"😴 Агент простаивает %d мин, а работа не доведена\n\nСессия: %s\n%s%s\n\nПодтолкнуть: /kill %s или напиши ему в сессии",
+			int(idleFor.Minutes()), session.ID, what, link, session.ID,
+		))
+		o.logger.Info("scm observer: stalled session reported", "session", session.ID, "idle", idleFor.String())
+	}
+	for id := range o.stalled {
+		if !seen[id] {
+			delete(o.stalled, id)
+		}
+	}
+}
+
+// sessionWorkIsUnfinished reports whether the agent still owes work: no PR at
+// all, or a PR a human cannot merge as it stands.
+func sessionWorkIsUnfinished(s *subject) bool {
+	if !s.hasPR || s.known.Number <= 0 {
+		return true
+	}
+	pr := s.known
+	if pr.Merged || pr.Closed {
+		return false
+	}
+	if pr.Draft {
+		return true
+	}
+	if pr.CI == domain.CIFailing || pr.CI == domain.CIPending || pr.CI == domain.CIUnknown {
+		return true
+	}
+	if pr.Review == domain.ReviewChangesRequest {
+		return true
+	}
+	return pr.Mergeability != domain.MergeMergeable
+}
+
+// stallReason names, in one phrase, what is blocking the PR.
+func stallReason(pr domain.PullRequest) string {
+	switch {
+	case pr.Draft:
+		return "черновик"
+	case pr.CI == domain.CIFailing:
+		return "CI красный"
+	case pr.CI == domain.CIPending || pr.CI == domain.CIUnknown:
+		return "CI не завершён"
+	case pr.Review == domain.ReviewChangesRequest:
+		return "запрошены правки"
+	case pr.Mergeability != domain.MergeMergeable:
+		return "конфликт с базовой веткой"
+	}
+	return "не готов"
 }
 
 // stampSessionLinks writes a link to the owning AO session into each PR

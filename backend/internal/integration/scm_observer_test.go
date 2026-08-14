@@ -137,6 +137,14 @@ func (p *cannedSCMProvider) FetchFailedCheckLogTail(_ context.Context, _ ports.S
 	return "", nil
 }
 
+func (p *cannedSCMProvider) FetchMentions(context.Context, ports.SCMPRRef) ([]ports.SCMMentionObservation, error) {
+	return nil, nil
+}
+
+func (p *cannedSCMProvider) EnsurePRBodyBlock(context.Context, ports.SCMPRRef, string, string) (bool, error) {
+	return false, nil
+}
+
 func (p *cannedSCMProvider) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef) (ports.SCMReviewObservation, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
