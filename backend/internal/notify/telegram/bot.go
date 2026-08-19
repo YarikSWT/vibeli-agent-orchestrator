@@ -75,7 +75,10 @@ type Duty interface {
 // writes code or opens a PR stays in the agent's hands. Whatever is not a
 // command goes to the agent on duty.
 type Bot struct {
-	client   *Client
+	client *Client
+	// identity is filled by the first successful getMe and only ever read and
+	// written by the poll goroutine.
+	identity Identity
 	sessions SessionLister
 	killer   Killer
 	gate     Gate
@@ -104,6 +107,7 @@ func (b *Bot) Start(ctx context.Context) <-chan struct{} {
 			if ctx.Err() != nil {
 				return
 			}
+			b.ensureIdentity(ctx)
 			updates, err := b.client.GetUpdates(ctx, offset, pollTimeout)
 			if err != nil {
 				if ctx.Err() != nil {
@@ -139,10 +143,13 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		b.logger.Warn("telegram: ignoring command from unknown chat", "chat", update.ChatID)
 		return
 	}
-	// Not a command means a human is talking. Hand it to the agent on duty
-	// instead of dropping it on the floor.
+	// Not a command means a human is talking — to the bot, or to the other
+	// humans in the chat. Only the first kind is the bot's business.
 	if !strings.HasPrefix(update.Text, "/") {
-		if err := b.client.Send(ctx, b.ask(ctx, update.Text)); err != nil {
+		if !b.addressed(update) {
+			return
+		}
+		if err := b.client.Send(ctx, b.ask(ctx, b.question(update))); err != nil {
 			b.logger.Warn("telegram: reply failed", "command", "<question>", "err", err)
 		}
 		return
@@ -171,7 +178,7 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 			"/resume — снова брать",
 			"/kill <id> — снять сессию",
 			"",
-			"любое сообщение без / уходит дежурному агенту — ответит сюда же",
+			"вопрос дежурному агенту — тэгом (@" + b.tag() + ") или реплаем на моё сообщение",
 		}, "\n")
 	default:
 		return
@@ -249,10 +256,127 @@ func (b *Bot) take(ctx context.Context, arg string) string {
 	return fmt.Sprintf("🤖 взял %s — %s\n\nсессия: %s", result.Issue, truncate(result.Title, 60), result.SessionID)
 }
 
+// ensureIdentity learns who the bot is. Without its username a tag cannot be
+// recognised, and without its id a reply to the bot cannot be told from a reply
+// to a human. It is retried on every poll because the daemon usually boots
+// before the network is reachable.
+func (b *Bot) ensureIdentity(ctx context.Context) {
+	if b.identity.Username != "" || b.client == nil {
+		return
+	}
+	me, err := b.client.GetMe(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			b.logger.Warn("telegram: getMe failed; tags stay unrecognised until it succeeds", "err", err)
+		}
+		return
+	}
+	b.identity = me
+	b.logger.Info("telegram: bot identity resolved", "username", me.Username, "id", me.ID)
+}
+
+// tag renders the bot's @name for help text.
+func (b *Bot) tag() string {
+	if b.identity.Username == "" {
+		return "имя бота"
+	}
+	return b.identity.Username
+}
+
+// addressed reports whether a non-command message is meant for the bot.
+//
+// The conveyor chat is a room where humans also talk to each other; a bot that
+// forwards every line to the agent on duty would turn that conversation into a
+// stream of interruptions. So in a group it answers only when tagged or when
+// someone replies to one of its own messages. A private chat is nothing but a
+// conversation with the bot, and every message there is addressed to it.
+func (b *Bot) addressed(update Update) bool {
+	if update.ChatType == "private" {
+		return true
+	}
+	if b.repliesToBot(update) {
+		return true
+	}
+	return b.tagged(update.Text)
+}
+
+// repliesToBot reports a reply to the bot's own message. Until getMe succeeds
+// the bot's id is unknown, and a reply to any bot in the configured chat is
+// taken as its own: over-answering beats swallowing a question.
+func (b *Bot) repliesToBot(update Update) bool {
+	if b.identity.ID != 0 {
+		return update.ReplyToFromID == b.identity.ID
+	}
+	return update.ReplyToFromIsBot
+}
+
+// tagged reports an @mention of the bot anywhere in the message. The match must
+// end on a word boundary, or @bot would also answer for @bot2.
+func (b *Bot) tagged(text string) bool {
+	if b.identity.Username == "" {
+		return false
+	}
+	needle := "@" + b.identity.Username
+	for i := 0; i+len(needle) <= len(text); i++ {
+		if strings.EqualFold(text[i:i+len(needle)], needle) && !nameByte(text, i+len(needle)) {
+			return true
+		}
+	}
+	return false
+}
+
+// nameByte reports whether position i continues a Telegram username, which is
+// made of letters, digits and underscores.
+func nameByte(text string, i int) bool {
+	if i >= len(text) {
+		return false
+	}
+	c := text[i]
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// question is what the agent on duty actually reads: the message without the
+// addressing, plus the line being replied to — the agent has no other way to
+// tell which of its own messages the human means.
+func (b *Bot) question(update Update) string {
+	text := b.stripTag(update.Text)
+	if quoted := truncate(update.ReplyToText, 300); quoted != "" && b.repliesToBot(update) {
+		if text == "" {
+			return "человек ответил на сообщение в чате «" + quoted + "»"
+		}
+		return "в ответ на сообщение в чате «" + quoted + "»:\n" + text
+	}
+	return text
+}
+
+// stripTag drops the bot's @name where it is pure addressing — at the start or
+// the end of the message. A tag inside a sentence is left alone: there it is
+// part of what the human wrote.
+func (b *Bot) stripTag(text string) string {
+	if b.identity.Username == "" {
+		return text
+	}
+	needle := "@" + b.identity.Username
+	trimmed := strings.TrimSpace(text)
+	for {
+		switch {
+		case len(trimmed) >= len(needle) && strings.EqualFold(trimmed[:len(needle)], needle) && !nameByte(trimmed, len(needle)):
+			trimmed = strings.TrimSpace(trimmed[len(needle):])
+		case len(trimmed) >= len(needle) && strings.EqualFold(trimmed[len(trimmed)-len(needle):], needle):
+			trimmed = strings.TrimSpace(trimmed[:len(trimmed)-len(needle)])
+		default:
+			return strings.TrimLeft(trimmed, " ,.:;-—\t")
+		}
+	}
+}
+
 // ask hands a human's message to the agent on duty and tells the chat where it
 // went. Every branch answers something: an unanswered message in a chat is
 // indistinguishable from a dead bot.
 func (b *Bot) ask(ctx context.Context, text string) string {
+	if strings.TrimSpace(text) == "" {
+		return "не понял вопрос — напиши, что нужно, тем же сообщением"
+	}
 	if b.duty == nil {
 		return "передать некому: дежурный агент не подключён к боту"
 	}

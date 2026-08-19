@@ -40,6 +40,8 @@ func (f *fakeAPI) server(t *testing.T) *httptest.Server {
 			f.sent = append(f.sent, body.Text)
 			f.mu.Unlock()
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasSuffix(r.URL.Path, "/getMe"):
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"id":1000,"username":"vibeli_ao_bot","is_bot":true}}`))
 		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
 			f.mu.Lock()
 			var batch []byte
@@ -188,15 +190,35 @@ func (f *fakeGate) Pause()       { f.paused = true }
 func (f *fakeGate) Resume()      { f.paused = false }
 func (f *fakeGate) Paused() bool { return f.paused }
 
+// updateBatch is one message in the conveyor's group chat — the shape the bot
+// sees in production.
 func updateBatch(id int64, chat, text string) []byte {
+	return messageBatch(id, chat, "supergroup", map[string]any{"text": text})
+}
+
+// replyBatch is a message answering someone else's, identified by author id.
+func replyBatch(id int64, chat, text string, replyFrom int64, replyText string) []byte {
+	return messageBatch(id, chat, "supergroup", map[string]any{
+		"text": text,
+		"reply_to_message": map[string]any{
+			"text": replyText,
+			"from": map[string]any{"id": replyFrom, "is_bot": replyFrom == 1000},
+		},
+	})
+}
+
+// privateBatch is a one-to-one chat with the bot.
+func privateBatch(id int64, chat, text string) []byte {
+	return messageBatch(id, chat, "private", map[string]any{"text": text})
+}
+
+func messageBatch(id int64, chat, chatType string, message map[string]any) []byte {
+	message["chat"] = map[string]any{"id": json.RawMessage(chat), "type": chatType}
 	payload := map[string]any{
 		"ok": true,
 		"result": []map[string]any{{
 			"update_id": id,
-			"message": map[string]any{
-				"text": text,
-				"chat": map[string]any{"id": json.RawMessage(chat)},
-			},
+			"message":   message,
 		}},
 	}
 	out, _ := json.Marshal(payload)
@@ -448,41 +470,128 @@ func (f *fakeDuty) list() []string {
 	return append([]string(nil), f.asked...)
 }
 
-func TestBotRoutesAPlainMessageToTheAgentOnDuty(t *testing.T) {
-	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "почему vibeli-7 стоит?")}}
-	duty := &fakeDuty{}
+func runDutyBot(t *testing.T, api *fakeAPI, duty Duty) {
+	t.Helper()
 	runBotWithDuty(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, duty)
+}
+
+func TestBotRoutesATaggedMessageToTheAgentOnDuty(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "@vibeli_ao_bot почему vibeli-7 стоит?")}}
+	duty := &fakeDuty{}
+	runDutyBot(t, api, duty)
 
 	got := waitForMessages(t, api, 1)
 	if asked := duty.list(); len(asked) != 1 || asked[0] != "почему vibeli-7 стоит?" {
-		t.Fatalf("asked = %#v, want the human's message verbatim", asked)
+		t.Fatalf("asked = %#v, want the question without the addressing", asked)
 	}
-	if !strings.Contains(got[0], "vibeli-24") {
-		t.Errorf("the reply must name the session that took the question:\n%s", got[0])
+	if len(got) == 0 || !strings.Contains(got[0], "vibeli-24") {
+		t.Errorf("the reply must name the session that took the question:\n%#v", got)
+	}
+}
+
+// The chat is a room where humans also talk to each other. A line that is not
+// addressed to the bot must not become an interruption for the agent on duty.
+func TestBotIgnoresChatterItIsNotAddressedIn(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "я вечером посмотрю #171")}}
+	duty := &fakeDuty{}
+	runDutyBot(t, api, duty)
+
+	time.Sleep(150 * time.Millisecond)
+	if asked := duty.list(); len(asked) != 0 {
+		t.Fatalf("an untagged line must not reach the agent: %#v", asked)
+	}
+	if got := api.messages(); len(got) != 0 {
+		t.Fatalf("an untagged line must not even get a reply: %#v", got)
+	}
+}
+
+func TestBotRoutesAReplyToItsOwnMessage(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{replyBatch(1, "42", "а почему так долго?", 1000, "💬 vibeli-24: взял #171")}}
+	duty := &fakeDuty{}
+	runDutyBot(t, api, duty)
+
+	waitForMessages(t, api, 1)
+	asked := duty.list()
+	if len(asked) != 1 {
+		t.Fatalf("a reply to the bot must reach the agent: %#v", asked)
+	}
+	if !strings.Contains(asked[0], "а почему так долго?") {
+		t.Errorf("the question is missing:\n%s", asked[0])
+	}
+	if !strings.Contains(asked[0], "взял #171") {
+		t.Errorf("the agent must see which message was replied to:\n%s", asked[0])
+	}
+}
+
+func TestBotIgnoresAReplyToAnotherHuman(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{replyBatch(1, "42", "согласен", 777, "давай смёржим #171")}}
+	duty := &fakeDuty{}
+	runDutyBot(t, api, duty)
+
+	time.Sleep(150 * time.Millisecond)
+	if asked := duty.list(); len(asked) != 0 {
+		t.Fatalf("a reply between humans must not reach the agent: %#v", asked)
+	}
+}
+
+// A private chat is nothing but a conversation with the bot: demanding a tag
+// there would be pointless ceremony.
+func TestBotRoutesEveryMessageInAPrivateChat(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{privateBatch(1, "42", "что с конвейером?")}}
+	duty := &fakeDuty{}
+	runDutyBot(t, api, duty)
+
+	waitForMessages(t, api, 1)
+	if asked := duty.list(); len(asked) != 1 || asked[0] != "что с конвейером?" {
+		t.Fatalf("asked = %#v, want the message verbatim", asked)
 	}
 }
 
 func TestBotAnswersWhenNobodyIsOnDuty(t *testing.T) {
-	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "живой?")}}
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "@vibeli_ao_bot живой?")}}
 	duty := &fakeDuty{err: ErrNoDutyAgent}
-	runBotWithDuty(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, duty)
+	runDutyBot(t, api, duty)
 
 	got := waitForMessages(t, api, 1)
-	if !strings.Contains(got[0], "дежурного") {
-		t.Errorf("a question with no one on duty must be answered, not swallowed:\n%s", got[0])
+	if len(got) == 0 || !strings.Contains(got[0], "дежурного") {
+		t.Errorf("a question with no one on duty must be answered, not swallowed:\n%#v", got)
 	}
 }
 
-func TestBotIgnoresPlainMessagesFromOtherChats(t *testing.T) {
-	api := &fakeAPI{updates: [][]byte{updateBatch(1, "999", "кто дежурный?")}}
+func TestBotIgnoresTaggedMessagesFromOtherChats(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "999", "@vibeli_ao_bot кто дежурный?")}}
 	duty := &fakeDuty{}
-	runBotWithDuty(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, duty)
+	runDutyBot(t, api, duty)
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 	if asked := duty.list(); len(asked) != 0 {
 		t.Fatalf("a message from an unknown chat must not reach the agent: %#v", asked)
 	}
 	if got := api.messages(); len(got) != 0 {
 		t.Fatalf("an unknown chat must not even get a reply: %#v", got)
+	}
+}
+
+func TestStripTagKeepsAMentionInsideASentence(t *testing.T) {
+	bot := &Bot{identity: Identity{Username: "vibeli_ao_bot"}}
+	if got := bot.stripTag("@vibeli_ao_bot, что там с #171?"); got != "что там с #171?" {
+		t.Errorf("leading tag = %q", got)
+	}
+	if got := bot.stripTag("что там с #171? @vibeli_ao_bot"); got != "что там с #171?" {
+		t.Errorf("trailing tag = %q", got)
+	}
+	if got := bot.stripTag("скажи @vibeli_ao_bot спасибо"); got != "скажи @vibeli_ao_bot спасибо" {
+		t.Errorf("a tag inside a sentence is part of the text, got %q", got)
+	}
+}
+
+// @bot must not answer for @bot2 — a different bot in the same chat.
+func TestTaggedRequiresAWordBoundary(t *testing.T) {
+	bot := &Bot{identity: Identity{Username: "vibeli_ao_bot"}}
+	if bot.tagged("@vibeli_ao_bot2 подскажи") {
+		t.Error("a longer username must not count as this bot's tag")
+	}
+	if !bot.tagged("@VIBELI_AO_BOT, что там?") {
+		t.Error("a tag is case-insensitive")
 	}
 }

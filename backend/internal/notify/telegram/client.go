@@ -118,12 +118,51 @@ func (c *Client) Send(ctx context.Context, text string) error {
 	return nil
 }
 
-// Update is the subset of a Telegram update AO acts on: a text message and the
-// chat it came from.
+// Identity is who Telegram says this bot is. The username is how a human tags
+// it in a group; the id is how a reply to one of its own messages is told from
+// a reply to somebody else's.
+type Identity struct {
+	ID       int64
+	Username string
+}
+
+// GetMe reads the bot's own identity.
+func (c *Client) GetMe(ctx context.Context) (Identity, error) {
+	var resp struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+		} `json:"result"`
+		Description string `json:"description"`
+	}
+	if err := c.call(ctx, "getMe", map[string]any{}, &resp); err != nil {
+		return Identity{}, err
+	}
+	if !resp.OK {
+		return Identity{}, fmt.Errorf("telegram: getMe rejected: %s", resp.Description)
+	}
+	return Identity{ID: resp.Result.ID, Username: resp.Result.Username}, nil
+}
+
+// Update is the subset of a Telegram update AO acts on: a text message, the
+// chat it came from, and — for a reply — who wrote the message being answered.
+// A group chat carries human conversation the bot is not part of, so knowing
+// whether a message is addressed to it takes more than the text.
 type Update struct {
-	ID     int64
-	ChatID string
-	Text   string
+	ID       int64
+	ChatID   string
+	ChatType string
+	Text     string
+	// ReplyToFromID is the author of the message this one replies to; zero when
+	// it is not a reply.
+	ReplyToFromID int64
+	// ReplyToFromIsBot marks a reply to some bot, used only while the bot's own
+	// id is still unknown.
+	ReplyToFromIsBot bool
+	// ReplyToText is what is being replied to, quoted back to the agent so it
+	// knows which of its messages the human means.
+	ReplyToText string
 }
 
 // GetUpdates long-polls for messages after offset. timeout is the server-side
@@ -148,8 +187,16 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 			Message  *struct {
 				Text string `json:"text"`
 				Chat struct {
-					ID json.Number `json:"id"`
+					ID   json.Number `json:"id"`
+					Type string      `json:"type"`
 				} `json:"chat"`
+				ReplyTo *struct {
+					Text string `json:"text"`
+					From *struct {
+						ID    int64 `json:"id"`
+						IsBot bool  `json:"is_bot"`
+					} `json:"from"`
+				} `json:"reply_to_message"`
 			} `json:"message"`
 		} `json:"result"`
 		Description string `json:"description"`
@@ -173,11 +220,20 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 			updates = append(updates, Update{ID: item.UpdateID})
 			continue
 		}
-		updates = append(updates, Update{
-			ID:     item.UpdateID,
-			ChatID: item.Message.Chat.ID.String(),
-			Text:   strings.TrimSpace(item.Message.Text),
-		})
+		update := Update{
+			ID:       item.UpdateID,
+			ChatID:   item.Message.Chat.ID.String(),
+			ChatType: item.Message.Chat.Type,
+			Text:     strings.TrimSpace(item.Message.Text),
+		}
+		if reply := item.Message.ReplyTo; reply != nil {
+			update.ReplyToText = strings.TrimSpace(reply.Text)
+			if reply.From != nil {
+				update.ReplyToFromID = reply.From.ID
+				update.ReplyToFromIsBot = reply.From.IsBot
+			}
+		}
+		updates = append(updates, update)
 	}
 	return updates, nil
 }
