@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,8 +22,16 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 type fakeAPI struct {
 	mu       sync.Mutex
 	sent     []string
+	edits    []editCall
+	editErr  bool
 	updates  [][]byte
 	updateIx int
+}
+
+// editCall is one editMessageText the bot issued.
+type editCall struct {
+	messageID int64
+	text      string
 }
 
 func (f *fakeAPI) server(t *testing.T) *httptest.Server {
@@ -38,7 +47,25 @@ func (f *fakeAPI) server(t *testing.T) *httptest.Server {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
 			f.sent = append(f.sent, body.Text)
+			id := len(f.sent)
 			f.mu.Unlock()
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":%d}}`, id)))
+		case strings.HasSuffix(r.URL.Path, "/editMessageText"):
+			var body struct {
+				MessageID int64  `json:"message_id"`
+				Text      string `json:"text"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			refuse := f.editErr
+			if !refuse {
+				f.edits = append(f.edits, editCall{messageID: body.MessageID, text: body.Text})
+			}
+			f.mu.Unlock()
+			if refuse {
+				_, _ = w.Write([]byte(`{"ok":false,"description":"message to edit not found"}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case strings.HasSuffix(r.URL.Path, "/getMe"):
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"id":1000,"username":"vibeli_ao_bot","is_bot":true}}`))
@@ -65,6 +92,12 @@ func (f *fakeAPI) messages() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.sent...)
+}
+
+func (f *fakeAPI) rewrites() []editCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]editCall(nil), f.edits...)
 }
 
 func newTestClient(t *testing.T, api *fakeAPI) *Client {
@@ -449,9 +482,25 @@ func TestTruncateCountsRunesNotBytes(t *testing.T) {
 // --- questions to the agent on duty ----------------------------------------
 
 type fakeDuty struct {
-	mu    sync.Mutex
-	asked []string
-	err   error
+	mu       sync.Mutex
+	asked    []string
+	awaiting map[string]int64
+	err      error
+}
+
+func (f *fakeDuty) Await(session string, messageID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.awaiting == nil {
+		f.awaiting = make(map[string]int64)
+	}
+	f.awaiting[session] = messageID
+}
+
+func (f *fakeDuty) held(session string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.awaiting[session]
 }
 
 func (f *fakeDuty) Ask(_ context.Context, text string) (string, error) {
@@ -593,5 +642,63 @@ func TestTaggedRequiresAWordBoundary(t *testing.T) {
 	}
 	if !bot.tagged("@VIBELI_AO_BOT, что там?") {
 		t.Error("a tag is case-insensitive")
+	}
+}
+
+// --- one question, one message ---------------------------------------------
+
+// The chat is told the question was taken, and the answer overwrites that very
+// message: a question must not cost the chat two lines.
+func TestBotHandsTheAcknowledgementToTheAnswer(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "@vibeli_ao_bot что там?")}}
+	duty := &fakeDuty{}
+	runDutyBot(t, api, duty)
+
+	waitForMessages(t, api, 1)
+	deadline := time.Now().Add(2 * time.Second)
+	for duty.held("vibeli-24") == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := duty.held("vibeli-24"); got != 1 {
+		t.Fatalf("the session must be handed the message id of its acknowledgement, got %d", got)
+	}
+}
+
+func TestPublisherReplaceOverwritesTheMessage(t *testing.T) {
+	api := &fakeAPI{}
+	pub := NewPublisher(newTestClient(t, api), discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pub.Start(ctx)
+
+	pub.Replace(7, "💬 vibeli-24: всё готово")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(api.rewrites()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	edits := api.rewrites()
+	if len(edits) != 1 || edits[0].messageID != 7 || edits[0].text != "💬 vibeli-24: всё готово" {
+		t.Fatalf("edits = %#v", edits)
+	}
+	if got := api.messages(); len(got) != 0 {
+		t.Fatalf("an overwrite must not also post a new message: %#v", got)
+	}
+}
+
+// Telegram refuses an edit on a message it no longer has. Losing the answer
+// would be worse than an extra line, so it falls back to a fresh message.
+func TestPublisherFallsBackWhenTheEditIsRefused(t *testing.T) {
+	api := &fakeAPI{editErr: true}
+	pub := NewPublisher(newTestClient(t, api), discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pub.Start(ctx)
+
+	pub.Replace(7, "ответ дежурного")
+
+	got := waitForMessages(t, api, 1)
+	if len(got) != 1 || got[0] != "ответ дежурного" {
+		t.Fatalf("sent = %#v, want the answer as a new message", got)
 	}
 }

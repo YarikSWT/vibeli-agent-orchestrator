@@ -16,15 +16,17 @@ import (
 )
 
 type fakeAnnouncer struct {
-	sent []string
-	err  error
+	sent     []string
+	sessions []string
+	err      error
 }
 
-func (f *fakeAnnouncer) Announce(_ context.Context, text string) error {
+func (f *fakeAnnouncer) Announce(_ context.Context, text, session string) error {
 	if f.err != nil {
 		return f.err
 	}
 	f.sent = append(f.sent, text)
+	f.sessions = append(f.sessions, session)
 	return nil
 }
 
@@ -84,7 +86,7 @@ func TestAnnounce_OverlongTextIsRejected(t *testing.T) {
 	srv := newAnnounceTestServer(t, chat)
 
 	// Cyrillic: a rune-counted cap must not be a byte-counted one.
-	res := postAnnounce(t, srv, `{"text":"`+strings.Repeat("я", 4097)+`"}`)
+	res := postAnnounce(t, srv, `{"text":"`+strings.Repeat("я", 4001)+`"}`)
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", res.StatusCode)
 	}
@@ -115,5 +117,20 @@ func TestAnnounce_WithoutChatIsNotImplemented(t *testing.T) {
 	res := postAnnounce(t, srv, `{"text":"привет"}`)
 	if res.StatusCode != http.StatusNotImplemented {
 		t.Fatalf("status = %d, want 501", res.StatusCode)
+	}
+}
+
+// The sender travels as its own field: the chat transport labels the message
+// with it and uses it to find the message this one answers.
+func TestAnnounce_PassesTheSendingSessionThrough(t *testing.T) {
+	chat := &fakeAnnouncer{}
+	srv := newAnnounceTestServer(t, chat)
+
+	res := postAnnounce(t, srv, `{"text":"всё готово","session":"vibeli-24"}`)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
+	}
+	if len(chat.sessions) != 1 || chat.sessions[0] != "vibeli-24" {
+		t.Fatalf("sessions = %#v", chat.sessions)
 	}
 }

@@ -4830,8 +4830,11 @@ components:
       type: object
     ControllersAnnounceRequest:
       properties:
+        session:
+          maxLength: 128
+          type: string
         text:
-          maxLength: 4096
+          maxLength: 4000
           minLength: 1
           type: string
       required:

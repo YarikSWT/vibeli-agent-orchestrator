@@ -63,7 +63,7 @@ func TestAnnounce_Success(t *testing.T) {
 	}
 }
 
-func TestAnnounce_LabelsTheSendingSession(t *testing.T) {
+func TestAnnounce_NamesTheSendingSession(t *testing.T) {
 	t.Setenv("AO_SESSION_ID", "vibeli-24")
 	cfg := setConfigEnv(t)
 	srv, capture := announceServer(t, http.StatusOK, `{"ok":true,"text":"x"}`)
@@ -75,9 +75,19 @@ func TestAnnounce_LabelsTheSendingSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
 	}
-	want := "💬 vibeli-24: PR готов"
-	if got := announcedText(t, capture); got != want {
-		t.Errorf("announced text = %q, want %q", got, want)
+	// The text stays the agent's words; the session is a separate field the
+	// daemon uses to label the message and to overwrite the right one.
+	if got := announcedText(t, capture); got != "PR готов" {
+		t.Errorf("announced text = %q, want the message unchanged", got)
+	}
+	var req struct {
+		Session string `json:"session"`
+	}
+	if err := json.Unmarshal([]byte(capture.body), &req); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if req.Session != "vibeli-24" {
+		t.Errorf("session = %q, want vibeli-24", req.Session)
 	}
 }
 

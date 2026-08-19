@@ -68,6 +68,9 @@ var ErrNoDutyAgent = errors.New("telegram: no orchestrator on duty")
 // agent on duty, and reports which session took it.
 type Duty interface {
 	Ask(ctx context.Context, text string) (session string, err error)
+	// Await says the chat is holding messageID for this session's answer, so
+	// the answer overwrites it instead of adding another message.
+	Await(session string, messageID int64)
 }
 
 // Bot answers control commands from the configured chat: what is running, what
@@ -149,8 +152,14 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		if !b.addressed(update) {
 			return
 		}
-		if err := b.client.Send(ctx, b.ask(ctx, b.question(update))); err != nil {
+		reply, session := b.ask(ctx, b.question(update))
+		messageID, err := b.client.SendMessage(ctx, reply)
+		if err != nil {
 			b.logger.Warn("telegram: reply failed", "command", "<question>", "err", err)
+			return
+		}
+		if session != "" && b.duty != nil {
+			b.duty.Await(session, messageID)
 		}
 		return
 	}
@@ -370,24 +379,28 @@ func (b *Bot) stripTag(text string) string {
 	}
 }
 
-// ask hands a human's message to the agent on duty and tells the chat where it
-// went. Every branch answers something: an unanswered message in a chat is
-// indistinguishable from a dead bot.
-func (b *Bot) ask(ctx context.Context, text string) string {
+// ask hands a human's message to the agent on duty and returns what the chat is
+// told, plus the session that took the question — empty when nobody did.
+//
+// Every branch answers something: an unanswered message in a chat is
+// indistinguishable from a dead bot. The answer branch is deliberately a
+// placeholder — the agent's reply overwrites it — so one question stays one
+// message.
+func (b *Bot) ask(ctx context.Context, text string) (string, string) {
 	if strings.TrimSpace(text) == "" {
-		return "не понял вопрос — напиши, что нужно, тем же сообщением"
+		return "не понял вопрос — напиши, что нужно, тем же сообщением", ""
 	}
 	if b.duty == nil {
-		return "передать некому: дежурный агент не подключён к боту"
+		return "передать некому: дежурный агент не подключён к боту", ""
 	}
 	session, err := b.duty.Ask(ctx, text)
 	switch {
 	case errors.Is(err, ErrNoDutyAgent):
-		return "дежурного сейчас нет — вопрос никому не ушёл. Подними оркестратора проекта и повтори."
+		return "дежурного сейчас нет — вопрос никому не ушёл. Подними оркестратора проекта и повтори.", ""
 	case err != nil:
-		return "не смог передать дежурному: " + err.Error()
+		return "не смог передать дежурному: " + err.Error(), ""
 	}
-	return "передал дежурному (" + session + ") — ответит сюда же."
+	return "…спросил дежурного (" + session + ") — ответ появится здесь же", session
 }
 
 func truncate(text string, limit int) string {

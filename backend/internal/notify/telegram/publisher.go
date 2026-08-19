@@ -27,7 +27,7 @@ type Publisher struct {
 	client *Client
 	logger *slog.Logger
 
-	queue chan string
+	queue chan outgoing
 	once  sync.Once
 	done  chan struct{}
 }
@@ -40,7 +40,7 @@ func NewPublisher(client *Client, logger *slog.Logger) *Publisher {
 	return &Publisher{
 		client: client,
 		logger: logger,
-		queue:  make(chan string, queueDepth),
+		queue:  make(chan outgoing, queueDepth),
 		done:   make(chan struct{}),
 	}
 }
@@ -55,10 +55,8 @@ func (p *Publisher) Start(ctx context.Context) <-chan struct{} {
 				select {
 				case <-ctx.Done():
 					return
-				case text := <-p.queue:
-					if err := p.client.Send(ctx, text); err != nil && ctx.Err() == nil {
-						p.logger.Warn("telegram: send failed", "err", err)
-					}
+				case msg := <-p.queue:
+					p.deliver(ctx, msg)
 				}
 			}
 		}()
@@ -76,19 +74,53 @@ func (p *Publisher) Publish(_ context.Context, event domain.NotificationEvent) e
 	return nil
 }
 
+// outgoing is one queued message. A non-zero replaces names a message the bot
+// already sent, whose text this one overwrites.
+type outgoing struct {
+	text     string
+	replaces int64
+}
+
 // Announce queues an arbitrary message — used for conveyor events that are not
 // stored notifications, such as a card being claimed off the board.
 //
 // It returns no error on a full queue: the caller is a lifecycle path that must
 // not fail because a chat is unreachable.
 func (p *Publisher) Announce(text string) {
-	if p == nil || strings.TrimSpace(text) == "" {
+	p.enqueue(outgoing{text: text})
+}
+
+// Replace overwrites a message the bot sent earlier instead of adding another
+// one. It is how an answer lands on the very message that promised it, so a
+// question costs the chat one line rather than two.
+func (p *Publisher) Replace(messageID int64, text string) {
+	p.enqueue(outgoing{text: text, replaces: messageID})
+}
+
+func (p *Publisher) enqueue(msg outgoing) {
+	if p == nil || strings.TrimSpace(msg.text) == "" {
 		return
 	}
 	select {
-	case p.queue <- text:
+	case p.queue <- msg:
 	default:
-		p.logger.Warn("telegram: queue full, dropping message", "text", firstLine(text))
+		p.logger.Warn("telegram: queue full, dropping message", "text", firstLine(msg.text))
+	}
+}
+
+// deliver writes one queued message. An edit that Telegram refuses (too old, or
+// the message was deleted) falls back to a fresh message: an extra line in the
+// chat is a smaller loss than a swallowed answer.
+func (p *Publisher) deliver(ctx context.Context, msg outgoing) {
+	if msg.replaces != 0 {
+		err := p.client.Edit(ctx, msg.replaces, msg.text)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		p.logger.Warn("telegram: edit failed, sending a new message", "message", msg.replaces, "err", err)
+	}
+	if err := p.client.Send(ctx, msg.text); err != nil && ctx.Err() == nil {
+		p.logger.Warn("telegram: send failed", "err", err)
 	}
 }
 

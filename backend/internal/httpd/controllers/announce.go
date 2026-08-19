@@ -14,9 +14,12 @@ import (
 )
 
 // maxAnnounceLen bounds one chat message. Telegram rejects anything longer than
-// 4096 characters, so a longer body would be accepted here and then silently
-// dropped at delivery.
-const maxAnnounceLen = 4096
+// 4096 characters, and the chat transport prefixes the sender, so the text
+// itself is capped a little below that.
+const maxAnnounceLen = 4000
+
+// maxAnnounceSessionLen bounds the sender label.
+const maxAnnounceSessionLen = 128
 
 // maxAnnounceBodyBytes bounds the request body. The text itself is capped at
 // maxAnnounceLen runes; this only keeps a runaway client from streaming.
@@ -33,7 +36,10 @@ var ErrChatUnavailable = errors.New("chat notifier is not configured")
 // holding the bot token: the daemon owns the transport and stays the single
 // place chat messages are formed, the agent only supplies the words.
 type ChatAnnouncer interface {
-	Announce(ctx context.Context, text string) error
+	// Announce posts text to the chat. session names the agent session it came
+	// from, or is empty for the daemon's own voice; the transport uses it to
+	// label the message and to overwrite the message that promised an answer.
+	Announce(ctx context.Context, text, session string) error
 }
 
 // AnnounceController owns POST /announce — the write half of the chat
@@ -69,7 +75,12 @@ func (c *AnnounceController) announce(w http.ResponseWriter, r *http.Request) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "TEXT_TOO_LONG", "Text is too long", nil)
 		return
 	}
-	if err := c.Chat.Announce(r.Context(), text); err != nil {
+	session := strings.TrimSpace(domain.SanitizeControlChars(in.Session))
+	if len([]rune(session)) > maxAnnounceSessionLen {
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "bad_request", "SESSION_TOO_LONG", "Session is too long", nil)
+		return
+	}
+	if err := c.Chat.Announce(r.Context(), text, session); err != nil {
 		envelope.WriteAPIError(w, r, http.StatusServiceUnavailable, "unavailable", "CHAT_UNAVAILABLE", err.Error(), nil)
 		return
 	}
@@ -78,7 +89,10 @@ func (c *AnnounceController) announce(w http.ResponseWriter, r *http.Request) {
 
 // AnnounceRequest is the body of POST /api/v1/announce.
 type AnnounceRequest struct {
-	Text string `json:"text" minLength:"1" maxLength:"4096"`
+	Text string `json:"text" minLength:"1" maxLength:"4000"`
+	// Session is the agent session speaking. Omitted for the daemon's own
+	// voice; `ao announce` fills it from AO_SESSION_ID.
+	Session string `json:"session,omitempty" maxLength:"128"`
 }
 
 // AnnounceResponse is the body of POST /api/v1/announce. Text echoes what was

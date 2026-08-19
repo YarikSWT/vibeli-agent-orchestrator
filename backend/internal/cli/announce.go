@@ -17,7 +17,8 @@ type announceOptions struct {
 // POST /api/v1/announce. The CLI keeps its own copy so it need not import
 // httpd.
 type announceAPIRequest struct {
-	Text string `json:"text"`
+	Text    string `json:"text"`
+	Session string `json:"session,omitempty"`
 }
 
 func newAnnounceCommand(ctx *commandContext) *cobra.Command {
@@ -40,11 +41,9 @@ func (c *commandContext) announce(ctx context.Context, opts announceOptions) err
 	if strings.TrimSpace(opts.message) == "" {
 		return usageError{errors.New("usage: --message is required")}
 	}
-	message := opts.message
-	// Chat readers see conveyor notifications from several sources; an agent's
-	// own words are worth attributing to the session that wrote them.
-	if sender := strings.TrimSpace(os.Getenv("AO_SESSION_ID")); sender != "" {
-		message = "💬 " + sender + ": " + message
-	}
-	return c.postJSON(ctx, "announce", announceAPIRequest{Text: message}, nil)
+	// The session travels as its own field rather than baked into the text:
+	// the daemon labels the message with it, and uses it to find the message
+	// this one is an answer to.
+	session := strings.TrimSpace(os.Getenv("AO_SESSION_ID"))
+	return c.postJSON(ctx, "announce", announceAPIRequest{Text: opts.message, Session: session}, nil)
 }

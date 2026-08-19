@@ -135,5 +135,6 @@ func mostRecentOrchestrator(sessions []domain.SessionRecord) (domain.SessionID, 
 func dutyQuestion(text string) string {
 	return "[вопрос от человека из чата конвейера]\n" + text +
 		"\n\nЭто не задача на код, а вопрос дежурному. Ответь коротко в тот же чат: " +
-		"ao announce --message \"...\""
+		"ao announce --message \"...\" — одним сообщением: первый announce перезапишет " +
+		"в чате строку «спросил дежурного», следующие лягут отдельными сообщениями."
 }

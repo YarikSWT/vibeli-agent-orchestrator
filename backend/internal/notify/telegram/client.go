@@ -100,8 +100,42 @@ func (c *Client) ChatID() string { return c.chatID }
 // Send posts one message. Text is sent as-is (no parse mode), so issue titles
 // and agent output cannot break formatting or be interpreted as markup.
 func (c *Client) Send(ctx context.Context, text string) error {
+	_, err := c.SendMessage(ctx, text)
+	return err
+}
+
+// SendMessage posts one message and returns its id, which is what a later edit
+// needs: an answer that overwrites the message promising it keeps one question
+// to one line in the chat.
+func (c *Client) SendMessage(ctx context.Context, text string) (int64, error) {
 	payload := map[string]any{
 		"chat_id":                  c.chatID,
+		"text":                     text,
+		"disable_web_page_preview": true,
+	}
+	var resp struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+		Description string `json:"description"`
+	}
+	if err := c.call(ctx, "sendMessage", payload, &resp); err != nil {
+		return 0, err
+	}
+	if !resp.OK {
+		return 0, fmt.Errorf("telegram: sendMessage rejected: %s", resp.Description)
+	}
+	return resp.Result.MessageID, nil
+}
+
+// Edit replaces the text of a message the bot sent earlier. Telegram refuses an
+// edit that changes nothing and one on a message older than 48 hours, so the
+// caller must be ready to fall back to a fresh message.
+func (c *Client) Edit(ctx context.Context, messageID int64, text string) error {
+	payload := map[string]any{
+		"chat_id":                  c.chatID,
+		"message_id":               messageID,
 		"text":                     text,
 		"disable_web_page_preview": true,
 	}
@@ -109,11 +143,11 @@ func (c *Client) Send(ctx context.Context, text string) error {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
 	}
-	if err := c.call(ctx, "sendMessage", payload, &resp); err != nil {
+	if err := c.call(ctx, "editMessageText", payload, &resp); err != nil {
 		return err
 	}
 	if !resp.OK {
-		return fmt.Errorf("telegram: sendMessage rejected: %s", resp.Description)
+		return fmt.Errorf("telegram: editMessageText rejected: %s", resp.Description)
 	}
 	return nil
 }
