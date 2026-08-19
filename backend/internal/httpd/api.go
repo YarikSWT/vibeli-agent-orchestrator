@@ -52,6 +52,9 @@ type APIDeps struct {
 	Browser             controllers.BrowserService
 	PreviewServer       controllers.ManagedPreviewServer
 	SessionCapabilities controllers.SessionCapabilityValidator
+	// Announce is the chat write surface. Nil keeps the route mounted and
+	// answering 501, like the other optional surfaces.
+	Announce controllers.ChatAnnouncer
 }
 
 // API owns one controller per resource and is the single Register call the
@@ -72,6 +75,7 @@ type API struct {
 	settings      *controllers.SettingsController
 	dev           *controllers.DevController
 	browser       *controllers.BrowserController
+	announce      *controllers.AnnounceController
 	events        *EventsController
 }
 
@@ -105,6 +109,7 @@ func NewAPI(cfg config.Config, deps APIDeps) *API {
 		settings:      &controllers.SettingsController{Svc: deps.Settings},
 		dev:           &controllers.DevController{Import: deps.DevImport},
 		browser:       &controllers.BrowserController{Svc: deps.Browser},
+		announce:      &controllers.AnnounceController{Chat: deps.Announce},
 		events:        &EventsController{Source: deps.CDC, Live: deps.Events},
 	}
 }
@@ -141,6 +146,7 @@ func (a *API) Register(root chi.Router) {
 			a.settings.Register(r)
 			a.dev.Register(r)
 			a.browser.Register(r)
+			a.announce.Register(r)
 			// Sibling REST controllers plug in here.
 		})
 		// Agent switching synchronously collects a handoff, starts the target,

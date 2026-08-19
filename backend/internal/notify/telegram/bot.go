@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -58,25 +59,38 @@ type Conveyor interface {
 	Claim(ctx context.Context, ref string) (ClaimResult, error)
 }
 
+// ErrNoDutyAgent reports that no orchestrator session is live to take a
+// question. The bot turns it into an answer, because silence in the chat is
+// indistinguishable from a broken bot.
+var ErrNoDutyAgent = errors.New("telegram: no orchestrator on duty")
+
+// Duty carries a free-form message — a human talking, not a command — to the
+// agent on duty, and reports which session took it.
+type Duty interface {
+	Ask(ctx context.Context, text string) (session string, err error)
+}
+
 // Bot answers control commands from the configured chat: what is running, what
 // is queued, start this card, pause claiming, drop a session. Anything that
-// writes code or opens a PR stays in the agent's hands.
+// writes code or opens a PR stays in the agent's hands. Whatever is not a
+// command goes to the agent on duty.
 type Bot struct {
 	client   *Client
 	sessions SessionLister
 	killer   Killer
 	gate     Gate
 	conveyor Conveyor
+	duty     Duty
 	logger   *slog.Logger
 }
 
 // NewBot wires a command bot. Any dependency may be nil; the matching command
 // then reports that it is unavailable instead of panicking.
-func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, logger *slog.Logger) *Bot {
+func NewBot(client *Client, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty, logger *slog.Logger) *Bot {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, conveyor: conveyor, logger: logger}
+	return &Bot{client: client, sessions: sessions, killer: killer, gate: gate, conveyor: conveyor, duty: duty, logger: logger}
 }
 
 // Start runs the long-poll loop until ctx is done and returns a channel closed
@@ -125,6 +139,14 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 		b.logger.Warn("telegram: ignoring command from unknown chat", "chat", update.ChatID)
 		return
 	}
+	// Not a command means a human is talking. Hand it to the agent on duty
+	// instead of dropping it on the floor.
+	if !strings.HasPrefix(update.Text, "/") {
+		if err := b.client.Send(ctx, b.ask(ctx, update.Text)); err != nil {
+			b.logger.Warn("telegram: reply failed", "command", "<question>", "err", err)
+		}
+		return
+	}
 	command, arg := splitCommand(update.Text)
 	var reply string
 	switch command {
@@ -148,6 +170,8 @@ func (b *Bot) handle(ctx context.Context, update Update) {
 			"/pause — не брать новые карточки",
 			"/resume — снова брать",
 			"/kill <id> — снять сессию",
+			"",
+			"любое сообщение без / уходит дежурному агенту — ответит сюда же",
 		}, "\n")
 	default:
 		return
@@ -223,6 +247,23 @@ func (b *Bot) take(ctx context.Context, arg string) string {
 		return "не смог взять " + ref + ": " + err.Error()
 	}
 	return fmt.Sprintf("🤖 взял %s — %s\n\nсессия: %s", result.Issue, truncate(result.Title, 60), result.SessionID)
+}
+
+// ask hands a human's message to the agent on duty and tells the chat where it
+// went. Every branch answers something: an unanswered message in a chat is
+// indistinguishable from a dead bot.
+func (b *Bot) ask(ctx context.Context, text string) string {
+	if b.duty == nil {
+		return "передать некому: дежурный агент не подключён к боту"
+	}
+	session, err := b.duty.Ask(ctx, text)
+	switch {
+	case errors.Is(err, ErrNoDutyAgent):
+		return "дежурного сейчас нет — вопрос никому не ушёл. Подними оркестратора проекта и повтори."
+	case err != nil:
+		return "не смог передать дежурному: " + err.Error()
+	}
+	return "передал дежурному (" + session + ") — ответит сюда же."
 }
 
 func truncate(text string, limit int) string {

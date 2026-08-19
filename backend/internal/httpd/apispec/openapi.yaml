@@ -210,6 +210,43 @@ paths:
       summary: Refresh the cached local agent adapter catalog
       tags:
       - agents
+  /api/v1/announce:
+    post:
+      operationId: announceToChat
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControllersAnnounceRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllersAnnounceResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Service Unavailable
+      summary: Post a message to the operator chat
+      tags:
+      - chat
   /api/v1/browser/commands:
     post:
       operationId: executeBrowserCommand
@@ -4791,6 +4828,25 @@ components:
         disabled:
           type: boolean
       type: object
+    ControllersAnnounceRequest:
+      properties:
+        text:
+          maxLength: 4096
+          minLength: 1
+          type: string
+      required:
+      - text
+      type: object
+    ControllersAnnounceResponse:
+      properties:
+        ok:
+          type: boolean
+        text:
+          type: string
+      required:
+      - ok
+      - text
+      type: object
     ControllersSessionView:
       properties:
         activity:
@@ -7768,3 +7824,5 @@ tags:
   name: mobile
 - description: Target-isolated desktop browser runtime (loopback only)
   name: browser
+- description: Operator chat side-channel (Telegram)
+  name: chat

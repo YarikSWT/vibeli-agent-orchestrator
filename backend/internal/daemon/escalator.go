@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/notify/telegram"
 	sessionsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/session"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
@@ -76,4 +77,63 @@ func (e *orchestratorEscalator) onDuty(ctx context.Context, project domain.Proje
 		}
 	}
 	return best.ID, found
+}
+
+// Ask delivers a human's chat message to the agent on duty and reports
+// which session took it.
+//
+// It is the inbound half of the chat side-channel: the outbound half already
+// tells the chat what the conveyor is doing, and a human who reads that has
+// follow-up questions. Unlike Escalate, this one cannot fail quietly — the
+// person is waiting for an answer — so it returns ErrNoDutyAgent instead of
+// doing nothing.
+//
+// The question is not project-scoped (a chat message names no board), so the
+// whole fleet is considered rather than one project's sessions.
+func (e *orchestratorEscalator) Ask(ctx context.Context, text string) (string, error) {
+	if e == nil {
+		return "", telegram.ErrNoDutyAgent
+	}
+	sessions, err := e.store.ListAllSessions(ctx)
+	if err != nil {
+		return "", err
+	}
+	target, ok := mostRecentOrchestrator(sessions)
+	if !ok {
+		return "", telegram.ErrNoDutyAgent
+	}
+	if err := e.sessions.Send(ctx, target, dutyQuestion(text), nil); err != nil {
+		return "", err
+	}
+	e.logger.Info("question from chat handed to orchestrator", "orchestrator", target)
+	return string(target), nil
+}
+
+// mostRecentOrchestrator picks the live orchestrator someone is actually
+// working with, on the same "most recently updated wins" rule onDuty uses.
+func mostRecentOrchestrator(sessions []domain.SessionRecord) (domain.SessionID, bool) {
+	var best domain.SessionRecord
+	found := false
+	for _, s := range sessions {
+		if s.Kind != domain.KindOrchestrator || s.IsTerminated {
+			continue
+		}
+		if strings.TrimSpace(string(s.ID)) == "" {
+			continue
+		}
+		if !found || s.UpdatedAt.After(best.UpdatedAt) {
+			best = s
+			found = true
+		}
+	}
+	return best.ID, found
+}
+
+// dutyQuestion frames the message for the agent. Without the frame, a bare line
+// of Russian arriving in a pane reads like a task brief; the agent needs to know
+// a human is waiting in the chat and how to answer them.
+func dutyQuestion(text string) string {
+	return "[вопрос от человека из чата конвейера]\n" + text +
+		"\n\nЭто не задача на код, а вопрос дежурному. Ответь коротко в тот же чат: " +
+		"ao announce --message \"...\""
 }

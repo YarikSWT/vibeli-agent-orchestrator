@@ -81,6 +81,8 @@ func Build() ([]byte, error) {
 			"Connect Mobile LAN bridge control (loopback/desktop only)"),
 		*(&openapi31.Tag{Name: "browser"}).WithDescription(
 			"Target-isolated desktop browser runtime (loopback only)"),
+		*(&openapi31.Tag{Name: "chat"}).WithDescription(
+			"Operator chat side-channel (Telegram)"),
 	}
 
 	for _, op := range operations() {
@@ -1587,6 +1589,19 @@ func sessionOperations() []operation {
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/announce", id: "announceToChat", tag: "chat",
+			summary: "Post a message to the operator chat",
+			reqBody: controllers.AnnounceRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.AnnounceResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				// Unavailable: the daemon runs without a chat transport
+				// configured, so there is nowhere to deliver the message.
+				{http.StatusServiceUnavailable, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
 			},
 		},
 		{

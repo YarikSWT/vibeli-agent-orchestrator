@@ -266,7 +266,11 @@ func Run() error {
 		return err
 	}
 	lcStack.trackerDone, lcStack.projectSyncDone = startTrackerIntake(ctx, store, sessionSvc, chatNotifier, log)
-	lcStack.chatBotDone = chatNotifier.startBot(ctx, store, sessionSvc)
+	// The agent on duty is both the escalation target for a stalled worker and
+	// the addressee of a human's question in chat, so it is built once here and
+	// handed to both.
+	dutyEscalator := newOrchestratorEscalator(store, sessionSvc, log)
+	lcStack.chatBotDone = chatNotifier.startBot(ctx, store, sessionSvc, dutyEscalator)
 
 	agentSvc := agentsvc.NewWithDeps(agentsvc.Deps{Cache: store, Discoverer: modelcatalog.Discoverer{}, Projects: store})
 	go func() {
@@ -329,7 +333,7 @@ func Run() error {
 		})
 		lcStack.LCM.SetUsageFinalizer(usageCollector)
 	}
-	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, chatNotifier, newOrchestratorEscalator(store, sessionSvc, log), log)
+	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, chatNotifier, dutyEscalator, log)
 	var prActions prsvc.ActionManager
 	if mergeProvider, mergeErr := newGitHubSCMProvider(log); mergeErr != nil {
 		logSCMProviderDisabled(log, mergeErr)
@@ -400,6 +404,7 @@ func Run() error {
 		UsageSummary:       usagesvc.NewSummaryReader(store),
 		Telemetry:          telemetrySink,
 		Mobile:             mc,
+		Announce:           chatAnnounceAPI{notifier: chatNotifier},
 		DevImport: devimportsvc.New(devimportsvc.Deps{
 			Store:         store,
 			TargetDataDir: cfg.DataDir,

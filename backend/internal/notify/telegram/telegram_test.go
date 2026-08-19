@@ -226,7 +226,12 @@ func runBot(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, g
 
 func runBotWithConveyor(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor) {
 	t.Helper()
-	bot := NewBot(newTestClient(t, api), sessions, killer, gate, conveyor, discardLogger())
+	runBotWithDuty(t, api, sessions, killer, gate, conveyor, nil)
+}
+
+func runBotWithDuty(t *testing.T, api *fakeAPI, sessions SessionLister, killer Killer, gate Gate, conveyor Conveyor, duty Duty) {
+	t.Helper()
+	bot := NewBot(newTestClient(t, api), sessions, killer, gate, conveyor, duty, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := bot.Start(ctx)
 	t.Cleanup(func() {
@@ -416,5 +421,68 @@ func TestTruncateCountsRunesNotBytes(t *testing.T) {
 	}
 	if got := truncate("короткий", 20); got != "короткий" {
 		t.Fatalf("short text must pass through unchanged, got %q", got)
+	}
+}
+
+// --- questions to the agent on duty ----------------------------------------
+
+type fakeDuty struct {
+	mu    sync.Mutex
+	asked []string
+	err   error
+}
+
+func (f *fakeDuty) Ask(_ context.Context, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return "", f.err
+	}
+	f.asked = append(f.asked, text)
+	return "vibeli-24", nil
+}
+
+func (f *fakeDuty) list() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.asked...)
+}
+
+func TestBotRoutesAPlainMessageToTheAgentOnDuty(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "почему vibeli-7 стоит?")}}
+	duty := &fakeDuty{}
+	runBotWithDuty(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, duty)
+
+	got := waitForMessages(t, api, 1)
+	if asked := duty.list(); len(asked) != 1 || asked[0] != "почему vibeli-7 стоит?" {
+		t.Fatalf("asked = %#v, want the human's message verbatim", asked)
+	}
+	if !strings.Contains(got[0], "vibeli-24") {
+		t.Errorf("the reply must name the session that took the question:\n%s", got[0])
+	}
+}
+
+func TestBotAnswersWhenNobodyIsOnDuty(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "42", "живой?")}}
+	duty := &fakeDuty{err: ErrNoDutyAgent}
+	runBotWithDuty(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, duty)
+
+	got := waitForMessages(t, api, 1)
+	if !strings.Contains(got[0], "дежурного") {
+		t.Errorf("a question with no one on duty must be answered, not swallowed:\n%s", got[0])
+	}
+}
+
+func TestBotIgnoresPlainMessagesFromOtherChats(t *testing.T) {
+	api := &fakeAPI{updates: [][]byte{updateBatch(1, "999", "кто дежурный?")}}
+	duty := &fakeDuty{}
+	runBotWithDuty(t, api, fakeSessions{}, &fakeKiller{}, &fakeGate{}, nil, duty)
+
+	time.Sleep(100 * time.Millisecond)
+	if asked := duty.list(); len(asked) != 0 {
+		t.Fatalf("a message from an unknown chat must not reach the agent: %#v", asked)
+	}
+	if got := api.messages(); len(got) != 0 {
+		t.Fatalf("an unknown chat must not even get a reply: %#v", got)
 	}
 }

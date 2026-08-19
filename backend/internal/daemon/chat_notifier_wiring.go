@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/controllers"
 	"github.com/aoagents/agent-orchestrator/backend/internal/notify"
 	"github.com/aoagents/agent-orchestrator/backend/internal/notify/telegram"
 	trackerintake "github.com/aoagents/agent-orchestrator/backend/internal/observe/trackerintake"
@@ -107,12 +108,37 @@ func (i intakeConveyor) Claim(ctx context.Context, ref string) (telegram.ClaimRe
 // service exist, since /status and /kill need both. Returns nil when chat is
 // not configured, which the daemon's shutdown path treats as "nothing to wait
 // for".
-func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessions *sessionsvc.Service) <-chan struct{} {
+func (c *chatNotifier) startBot(ctx context.Context, store *sqlite.Store, sessions *sessionsvc.Service, duty *orchestratorEscalator) <-chan struct{} {
 	if c == nil || c.client == nil {
 		return nil
 	}
-	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.conveyor, c.logger)
+	// A nil escalator must stay a nil interface: wrapped in one, the bot would
+	// believe it has somewhere to send questions.
+	var desk telegram.Duty
+	if duty != nil {
+		desk = duty
+	}
+	bot := telegram.NewBot(c.client, store, chatSessionKiller{sessions: sessions}, c.gate, c.conveyor, desk, c.logger)
 	return bot.Start(ctx)
+}
+
+// chatAnnounceAPI is the write half of the chat side-channel, mounted at
+// POST /api/v1/announce and reached by `ao announce`.
+//
+// Agents run with the bot token in their environment and could call Telegram
+// directly. They must not: routing through the daemon keeps message formation
+// in one place and keeps the right to speak as the bot a daemon capability
+// rather than an ambient one.
+type chatAnnounceAPI struct {
+	notifier *chatNotifier
+}
+
+func (a chatAnnounceAPI) Announce(_ context.Context, text string) error {
+	if a.notifier == nil || a.notifier.pub == nil {
+		return controllers.ErrChatUnavailable
+	}
+	a.notifier.pub.Announce(text)
+	return nil
 }
 
 // chatSessionKiller adapts the session service to the bot's Killer surface.
