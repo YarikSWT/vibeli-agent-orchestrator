@@ -23,10 +23,6 @@ const (
 	// DefaultTickInterval matches intake's cadence: this loop is the write half
 	// of the same board conversation, and polling faster only burns GraphQL quota.
 	DefaultTickInterval = time.Minute
-	// DefaultReclaimGrace is how long a fresh session is left alone before a
-	// card still sitting in the ready column counts as a human reclaim rather
-	// than as this loop not having caught up yet.
-	DefaultReclaimGrace = 2 * time.Minute
 )
 
 // StatusMap names the board columns AO writes. An empty column name disables
@@ -72,11 +68,10 @@ type Killer interface {
 
 // Config holds optional knobs. Zero values use production defaults.
 type Config struct {
-	Tick         time.Duration
-	ReclaimGrace time.Duration
-	Statuses     StatusMap
-	Clock        func() time.Time
-	Logger       *slog.Logger
+	Tick     time.Duration
+	Statuses StatusMap
+	Clock    func() time.Time
+	Logger   *slog.Logger
 }
 
 // Observer pushes session state onto the board and honors human reclaims.
@@ -84,11 +79,10 @@ type Observer struct {
 	resolver     BoardResolver
 	store        Store
 	killer       Killer
-	tick         time.Duration
-	reclaimGrace time.Duration
-	statuses     StatusMap
-	clock        func() time.Time
-	logger       *slog.Logger
+	tick     time.Duration
+	statuses StatusMap
+	clock    func() time.Time
+	logger   *slog.Logger
 
 	// lastWritten suppresses repeat writes for a card AO already moved. The
 	// board read still happens, so an externally changed column is noticed.
@@ -96,13 +90,16 @@ type Observer struct {
 	// warnedMissing remembers columns the board does not have, so a board
 	// without "In review" logs once instead of on every tick.
 	warnedMissing map[string]bool
-	// firstSeen records when this loop first laid eyes on a session. The reclaim
-	// grace runs from that moment, not from the session's birth: a sweep that
-	// falls behind (a rate-limited board, a hundred sessions) would otherwise
-	// meet a brand-new session whose card it has not moved yet, read the card as
-	// still "Ready", and kill the session as reclaimed — which intake answers by
-	// claiming the same card again, forever.
-	firstSeen map[domain.SessionID]time.Time
+	// leftReady remembers sessions whose card this loop has actually seen out of
+	// the ready column. Only those can be "reclaimed": a card that reads
+	// "Ready" for a session that never left it has simply not been moved yet.
+	//
+	// Elapsed time cannot answer this. A sweep falls behind for reasons that
+	// have nothing to do with the human — a rate-limited board, a hundred
+	// sessions to walk — and any deadline measured against it eventually
+	// mistakes "not moved yet" for "taken back", kills a working session, and
+	// hands the card straight back to intake, which claims it again.
+	leftReady map[domain.SessionID]bool
 }
 
 // New constructs an Observer with safe defaults.
@@ -112,19 +109,15 @@ func New(resolver BoardResolver, store Store, killer Killer, cfg Config) *Observ
 		store:         store,
 		killer:        killer,
 		tick:          cfg.Tick,
-		reclaimGrace:  cfg.ReclaimGrace,
 		statuses:      cfg.Statuses,
 		clock:         cfg.Clock,
 		logger:        cfg.Logger,
 		lastWritten:   map[domain.IssueID]string{},
 		warnedMissing: map[string]bool{},
-		firstSeen:     map[domain.SessionID]time.Time{},
+		leftReady:     map[domain.SessionID]bool{},
 	}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
-	}
-	if o.reclaimGrace <= 0 {
-		o.reclaimGrace = DefaultReclaimGrace
 	}
 	if o.statuses == (StatusMap{}) {
 		o.statuses = DefaultStatusMap()
@@ -177,7 +170,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	o.noteSeen(sessions)
+	o.forgetGoneSessions(sessions)
 	for _, session := range currentSessions(sessions) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -241,6 +234,7 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 		}
 		return
 	}
+	o.noteCardStatus(session, current)
 	prs, err := o.store.ListPRsBySession(ctx, session.ID)
 	if err != nil {
 		o.logger.Warn("project sync: read session PRs failed", "session", session.ID, "err", err)
@@ -262,6 +256,7 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 			o.logger.Info("project sync: card is back in the ready column, leaving it to intake",
 				"session", session.ID, "issue", issueID, "status", current)
 			delete(o.lastWritten, issueID)
+			delete(o.leftReady, session.ID)
 			return
 		}
 		if o.killer == nil {
@@ -274,6 +269,7 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 			return
 		}
 		delete(o.lastWritten, issueID)
+		delete(o.leftReady, session.ID)
 		return
 	}
 
@@ -293,17 +289,21 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 		return
 	}
 	o.lastWritten[issueID] = want
+	o.noteCardStatus(session, want)
 	o.logger.Info("project sync: card moved", "session", session.ID, "issue", issueID, "from", current, "to", want)
 }
 
 // isReclaim reports whether a card sitting in the ready column means a human
 // took the work back.
 //
-// A live session younger than the grace window is exempt: right after a spawn
-// the card legitimately still reads "Ready" because this loop has not moved it
-// yet. For a terminated session that reasoning does not apply — it has no fresh
-// spawn to protect, and a card that reads "Ready" after the work ended can only
-// mean the task was reopened by hand.
+// The proof is that the card left the ready column at some point and came back:
+// this loop moves a claimed card to "In progress" itself, so a card it has seen
+// elsewhere and now finds in "Ready" was moved by someone else. A card that has
+// only ever read "Ready" is one this loop has not caught up with yet.
+//
+// A terminated session is the other half: its card cannot have been moved back
+// by the pipeline, so a card in the ready column after the work ended means the
+// task was reopened by hand.
 func (o *Observer) isReclaim(current string, session domain.SessionRecord) bool {
 	if !strings.EqualFold(current, domain.DefaultProjectReadyStatus) {
 		return false
@@ -311,27 +311,27 @@ func (o *Observer) isReclaim(current string, session domain.SessionRecord) bool 
 	if session.IsTerminated {
 		return true
 	}
-	seen, ok := o.firstSeen[session.ID]
-	if !ok {
-		return false
-	}
-	return o.clock().UTC().Sub(seen.UTC()) >= o.reclaimGrace
+	return o.leftReady[session.ID]
 }
 
-// noteSeen stamps the first sweep that saw a session and forgets sessions that
-// are gone, so the map tracks the store rather than growing with it.
-func (o *Observer) noteSeen(sessions []domain.SessionRecord) {
-	now := o.clock().UTC()
+// noteCardStatus records that a session's card has been seen out of the ready
+// column, and forgets sessions the store no longer has.
+func (o *Observer) noteCardStatus(session domain.SessionRecord, current string) {
+	if !strings.EqualFold(current, domain.DefaultProjectReadyStatus) {
+		o.leftReady[session.ID] = true
+	}
+}
+
+// forgetGoneSessions keeps the reclaim bookkeeping the size of the store rather
+// than of everything the daemon has ever seen.
+func (o *Observer) forgetGoneSessions(sessions []domain.SessionRecord) {
 	alive := make(map[domain.SessionID]bool, len(sessions))
 	for _, session := range sessions {
 		alive[session.ID] = true
-		if _, ok := o.firstSeen[session.ID]; !ok {
-			o.firstSeen[session.ID] = now
-		}
 	}
-	for id := range o.firstSeen {
+	for id := range o.leftReady {
 		if !alive[id] {
-			delete(o.firstSeen, id)
+			delete(o.leftReady, id)
 		}
 	}
 }

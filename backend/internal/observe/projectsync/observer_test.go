@@ -2,6 +2,7 @@ package projectsync
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -183,8 +184,8 @@ func TestCardDraggedBackToReadyKillsTheSession(t *testing.T) {
 		Clock:  func() time.Time { return now },
 		Logger: discardLogger(),
 	})
-	// The first sweep is the one that stamps the session as seen; the human
-	// drag is only distinguishable from "not moved yet" on a later sweep.
+	// The first sweep moves the card to In progress; that is what makes a later
+	// "Ready" distinguishable from a card this loop simply has not moved yet.
 	if err := observer.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -270,10 +271,10 @@ func TestSecondAttemptOwnsTheCardInsteadOfTheMergedOne(t *testing.T) {
 
 func TestSweepThatFallsBehindDoesNotKillAFreshSession(t *testing.T) {
 	created := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
-	// The session is already older than the grace window when this loop first
-	// gets to it — a rate-limited board makes one sweep take minutes. Its card
-	// still reads "Ready" because nothing has moved it yet, which must not be
-	// mistaken for a human taking the work back.
+	// The session has been alive for half an hour by the time this loop first
+	// gets to its card — a rate-limited board stalls the sweep for exactly that
+	// long. The card still reads "Ready" because nothing has moved it yet, which
+	// must not be mistaken for a human taking the work back.
 	now := created.Add(30 * time.Minute)
 	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "Ready"}}
 	store := &fakeStore{projects: []domain.ProjectRecord{boardProject()}, sessions: []domain.SessionRecord{session(created)}}
@@ -287,6 +288,39 @@ func TestSweepThatFallsBehindDoesNotKillAFreshSession(t *testing.T) {
 	}
 	if len(board.writes) != 1 || board.writes[0].status != "In progress" {
 		t.Fatalf("writes = %#v, want the card moved to In progress", board.writes)
+	}
+}
+
+func TestUnreadableBoardDoesNotAgeASessionIntoAReclaim(t *testing.T) {
+	created := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	now := created
+	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "Ready"}}
+	store := &fakeStore{projects: []domain.ProjectRecord{boardProject()}, sessions: []domain.SessionRecord{session(created)}}
+	killer := &fakeKiller{}
+
+	observer := New(fakeResolver{board}, store, killer, Config{
+		Clock:  func() time.Time { return now },
+		Logger: discardLogger(),
+	})
+	// The board is unreadable for ten minutes — a burnt GraphQL quota — so the
+	// card never gets moved off Ready. When reads come back, the session is long
+	// past any deadline, and killing it would hand the card back to intake.
+	board.err = errors.New("api rate limit already exceeded")
+	for range 10 {
+		if err := observer.Poll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	board.err = nil
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(killer.killed) != 0 {
+		t.Fatalf("killed = %v, want none: the card was unreadable, not reclaimed", killer.killed)
+	}
+	if len(board.writes) != 1 || board.writes[0].status != "In progress" {
+		t.Fatalf("writes = %#v, want the card moved to In progress once reads recover", board.writes)
 	}
 }
 
