@@ -169,7 +169,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, session := range sessions {
+	for _, session := range currentSessions(sessions) {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -180,6 +180,46 @@ func (o *Observer) Poll(ctx context.Context) error {
 		o.syncSession(ctx, board, session)
 	}
 	return nil
+}
+
+// currentSessions keeps one session per issue: the one whose state the card
+// should reflect. An issue picked up twice — the first attempt merged, then
+// reopened and claimed again — otherwise had both sessions writing the card on
+// every tick, the old one moving it to Done and the new one back to In review,
+// several times a minute.
+//
+// A live session wins over a terminated one, and among equals the newest wins:
+// the card belongs to the attempt that is happening now.
+func currentSessions(sessions []domain.SessionRecord) []domain.SessionRecord {
+	best := make(map[domain.IssueID]domain.SessionRecord, len(sessions))
+	order := make([]domain.IssueID, 0, len(sessions))
+	for _, session := range sessions {
+		if session.IssueID == "" {
+			continue
+		}
+		previous, seen := best[session.IssueID]
+		if !seen {
+			best[session.IssueID] = session
+			order = append(order, session.IssueID)
+			continue
+		}
+		if outranks(session, previous) {
+			best[session.IssueID] = session
+		}
+	}
+	picked := make([]domain.SessionRecord, 0, len(order))
+	for _, issue := range order {
+		picked = append(picked, best[issue])
+	}
+	return picked
+}
+
+// outranks reports whether a should own the card instead of b.
+func outranks(a, b domain.SessionRecord) bool {
+	if a.IsTerminated != b.IsTerminated {
+		return !a.IsTerminated
+	}
+	return a.CreatedAt.After(b.CreatedAt)
 }
 
 // syncSession reconciles one session against its card.

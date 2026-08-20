@@ -227,6 +227,35 @@ func TestReopenedTaskOnReadyCardIsNotPushedBackToDone(t *testing.T) {
 	}
 }
 
+func TestSecondAttemptOwnsTheCardInsteadOfTheMergedOne(t *testing.T) {
+	created := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	now := created.Add(2 * time.Hour)
+	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "In review"}}
+
+	merged := session(created)
+	merged.ID = "vibeli-1"
+	merged.IsTerminated = true
+
+	live := session(now)
+	live.ID = "vibeli-2"
+
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{boardProject()},
+		sessions: []domain.SessionRecord{merged, live},
+		prs: map[domain.SessionID][]domain.PullRequest{
+			"vibeli-1": {{Number: 76, Merged: true}},
+			"vibeli-2": {{Number: 90}},
+		},
+	}
+
+	if err := newObserver(board, store, &fakeKiller{}, now).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(board.writes) != 0 {
+		t.Fatalf("the merged attempt must not drag the card to Done: %#v", board.writes)
+	}
+}
+
 func TestProjectsWithoutBoardIntakeAreIgnored(t *testing.T) {
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
 	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "Ready"}}
