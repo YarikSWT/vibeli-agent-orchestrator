@@ -17,8 +17,9 @@ import (
 // It exists because the alternative is waking a human for every agent that
 // stops mid-task, and most stalls are dull: a context compaction that lost the
 // thread, a command waiting on input that never came. The orchestrator can look
-// at the pane and decide; the chat message still goes out in parallel, so a
-// missing or wedged orchestrator never swallows the signal.
+// at the pane and decide, and the human hears about the stall only when nobody
+// on duty took it — so the signal is never swallowed, but it also stops being
+// noise.
 type orchestratorEscalator struct {
 	store    *sqlite.Store
 	sessions *sessionsvc.Service
@@ -35,23 +36,24 @@ func newOrchestratorEscalator(store *sqlite.Store, sessions *sessionsvc.Service,
 	return &orchestratorEscalator{store: store, sessions: sessions, logger: logger}
 }
 
-// Escalate sends the stall report to the project's live orchestrator. Doing
-// nothing is a valid outcome: a project without an orchestrator simply relies on
-// the chat notification.
-func (e *orchestratorEscalator) Escalate(ctx context.Context, project domain.ProjectID, stalled domain.SessionID, text string) {
+// Escalate sends the stall report to the project's live orchestrator and
+// reports whether it landed. A false answer — no orchestrator, or one that
+// would not take the message — is what puts the stall in front of a human
+// instead.
+func (e *orchestratorEscalator) Escalate(ctx context.Context, project domain.ProjectID, stalled domain.SessionID, text string) bool {
 	if e == nil {
-		return
+		return false
 	}
 	target, ok := e.onDuty(ctx, project, stalled)
 	if !ok {
-		return
+		return false
 	}
 	if err := e.sessions.Send(ctx, target, text, nil); err != nil {
-		// Best effort by design: the operator was told in the same breath.
 		e.logger.Warn("escalation to orchestrator failed", "orchestrator", target, "stalled", stalled, "err", err)
-		return
+		return false
 	}
 	e.logger.Info("stalled session escalated to orchestrator", "orchestrator", target, "stalled", stalled)
+	return true
 }
 
 // onDuty picks the project's live orchestrator. With several, the most recently

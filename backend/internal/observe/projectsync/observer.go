@@ -202,6 +202,18 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 	// column is work a human took back. Kill it and let intake re-claim from a
 	// clean workspace on the next sweep.
 	if o.isReclaim(current, session) {
+		// Завершённую сессию убивать нечего: карточка вернулась в готовые уже
+		// после её конца — значит человек переоткрыл задачу и ждёт, что её
+		// возьмут заново. Молча уходим, и следующий обход intake её подберёт.
+		// Без этого синк на каждом тике возвращал карточку в Done по факту
+		// смёрженного PR, а встроенная автоматизация доски закрывала issue —
+		// вернуть задачу в работу руками было невозможно.
+		if session.IsTerminated {
+			o.logger.Info("project sync: card is back in the ready column, leaving it to intake",
+				"session", session.ID, "issue", issueID, "status", current)
+			delete(o.lastWritten, issueID)
+			return
+		}
 		if o.killer == nil {
 			o.logger.Warn("project sync: card reclaimed but no killer wired", "session", session.ID, "issue", issueID)
 			return
@@ -235,15 +247,19 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 }
 
 // isReclaim reports whether a card sitting in the ready column means a human
-// took the work back. A session younger than the grace window is exempt: right
-// after a spawn the card legitimately still reads "Ready" because this loop has
-// not moved it yet.
+// took the work back.
+//
+// A live session younger than the grace window is exempt: right after a spawn
+// the card legitimately still reads "Ready" because this loop has not moved it
+// yet. For a terminated session that reasoning does not apply — it has no fresh
+// spawn to protect, and a card that reads "Ready" after the work ended can only
+// mean the task was reopened by hand.
 func (o *Observer) isReclaim(current string, session domain.SessionRecord) bool {
-	if session.IsTerminated {
-		return false
-	}
 	if !strings.EqualFold(current, domain.DefaultProjectReadyStatus) {
 		return false
+	}
+	if session.IsTerminated {
+		return true
 	}
 	return o.clock().UTC().Sub(session.CreatedAt.UTC()) >= o.reclaimGrace
 }

@@ -70,8 +70,12 @@ type Announcer interface {
 // Escalator hands a stalled session to the project's orchestrator — the agent
 // on duty — so a human is not the only one who can look at it. Optional: nil
 // means stalls are only announced to the chat.
+//
+// Escalate reports whether the stall actually reached an agent. It decides
+// whether the chat hears about it at all: a stall the agent on duty is already
+// looking at is not news for a human.
 type Escalator interface {
-	Escalate(ctx context.Context, project domain.ProjectID, stalled domain.SessionID, text string)
+	Escalate(ctx context.Context, project domain.ProjectID, stalled domain.SessionID, text string) bool
 }
 
 // Store is the persistence contract the observer needs for discovery, local
@@ -1180,18 +1184,22 @@ func (o *Observer) reportStalledSessions(ctx context.Context, subjects map[strin
 		if o.webBaseURL != "" && session.ProjectID != "" {
 			link = fmt.Sprintf("\n%s/#/projects/%s/sessions/%s", o.webBaseURL, session.ProjectID, session.ID)
 		}
+		escalated := false
 		if o.escalator != nil {
-			o.escalator.Escalate(ctx, session.ProjectID, session.ID,
-				fmt.Sprintf("Сессия %s простаивает %d мин, работа не доведена: %s. Разберись, что произошло, и доложи.",
+			escalated = o.escalator.Escalate(ctx, session.ProjectID, session.ID,
+				fmt.Sprintf("Сессия %s простаивает %d мин, работа не доведена: %s. Разберись, что произошло.",
 					session.ID, int(idleFor.Minutes()), what))
 		}
-		if o.announcer != nil {
+		// The chat hears about a stall only when nobody took it. Most stalls are
+		// dull and the agent on duty settles them without a human; announcing
+		// every one of them turned the chat into a feed nobody reads.
+		if !escalated && o.announcer != nil {
 			o.announcer.Announce(fmt.Sprintf(
-				"😴 Агент простаивает %d мин, а работа не доведена\n\nСессия: %s\n%s%s\n\nПодтолкнуть: /kill %s или напиши ему в сессии",
+				"😴 Агент простаивает %d мин, работа не доведена, а дежурного нет\n\nСессия: %s\n%s%s\n\nПодтолкнуть: /kill %s или напиши ему в сессии",
 				int(idleFor.Minutes()), session.ID, what, link, session.ID,
 			))
 		}
-		o.logger.Info("scm observer: stalled session reported", "session", session.ID, "idle", idleFor.String())
+		o.logger.Info("scm observer: stalled session reported", "session", session.ID, "idle", idleFor.String(), "escalated", escalated)
 	}
 	for id := range o.stalled {
 		if !seen[id] {
