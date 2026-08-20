@@ -21,6 +21,36 @@ func (f *fakeEscalator) Escalate(_ context.Context, _ domain.ProjectID, stalled 
 	return !f.declined
 }
 
+// A daemon that just booted says nothing about stalls: its sessions are still
+// being restored, so nobody is on duty to take them.
+func TestStall_IsHeldBackRightAfterBoot(t *testing.T) {
+	now := time.Now().UTC()
+	announcer := &fakeAnnouncer{}
+	escalator := &fakeEscalator{declined: true}
+	o := New(&fakeProvider{}, &fakeStore{}, &fakeLifecycle{}, Config{
+		Logger: quietSlog(), CacheMax: 32, Announcer: announcer, Escalator: escalator,
+		StallAfter: 30 * time.Minute,
+	})
+	o.startedAt = now
+
+	o.reportStalledSessions(context.Background(), map[string]*subject{
+		"k": stallSubject("vibeli-16", 90*time.Minute, now, domain.PullRequest{}, false),
+	}, now)
+
+	if len(announcer.texts) != 0 || len(escalator.targets) != 0 {
+		t.Fatalf("nothing is stalled while the daemon is still coming up: chat=%v duty=%v",
+			announcer.texts, escalator.targets)
+	}
+
+	// One grace period later the same stall is reported as usual.
+	o.reportStalledSessions(context.Background(), map[string]*subject{
+		"k": stallSubject("vibeli-16", 90*time.Minute, now, domain.PullRequest{}, false),
+	}, now.Add(stallGraceAfterBoot+time.Minute))
+	if len(escalator.targets) != 1 {
+		t.Fatalf("after the grace period the stall must be reported: %v", escalator.targets)
+	}
+}
+
 func TestStall_IsHandedToTheOrchestratorOnDuty(t *testing.T) {
 	now := time.Now().UTC()
 	announcer := &fakeAnnouncer{}

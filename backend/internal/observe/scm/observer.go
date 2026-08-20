@@ -197,6 +197,10 @@ type Observer struct {
 	announcer Announcer
 	// escalator hands the stall to the orchestrator on duty; nil disables it.
 	escalator Escalator
+	// startedAt is when the poll loop started, used to hold stall reports until
+	// the sessions the daemon restores are back. Zero — a test driving the
+	// observer directly — means no hold.
+	startedAt time.Time
 	// stallAfter is the idle span that counts as stalled; zero disables.
 	stallAfter time.Duration
 	// stalled remembers which sessions were already reported, so one stall is
@@ -254,6 +258,7 @@ func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Obser
 // wrap stays once-per-process; a transient error there simply defers the check
 // to the next tick.
 func (o *Observer) Start(ctx context.Context) <-chan struct{} {
+	o.startedAt = o.clock()
 	var credentialGate sync.Once
 	poll := func(ctx context.Context) error {
 		credentialGate.Do(func() {
@@ -1139,6 +1144,11 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 	}
 }
 
+// stallGraceAfterBoot is how long stall reporting stays quiet after the daemon
+// starts, so restored sessions and the agent on duty are back before anything
+// is called stalled.
+const stallGraceAfterBoot = 3 * time.Minute
+
 // reportStalledSessions tells the operator about agents that stopped with work
 // unfinished.
 //
@@ -1149,6 +1159,14 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 // it simply stopped.
 func (o *Observer) reportStalledSessions(ctx context.Context, subjects map[string]*subject, now time.Time) {
 	if (o.announcer == nil && o.escalator == nil) || o.stallAfter < 0 {
+		return
+	}
+	// A restart clears the reported-stalls map and the first poll beats session
+	// restore to the punch: every stalled session looks new, and the agent on
+	// duty is not back yet to take it — so each one would be announced to a
+	// human. Hold the report until the daemon has settled; a stall that has
+	// waited hours can wait one more tick.
+	if !o.startedAt.IsZero() && now.Sub(o.startedAt) < stallGraceAfterBoot {
 		return
 	}
 	seen := map[domain.SessionID]bool{}

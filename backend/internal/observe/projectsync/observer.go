@@ -202,12 +202,13 @@ func (o *Observer) syncSession(ctx context.Context, board Board, session domain.
 	// column is work a human took back. Kill it and let intake re-claim from a
 	// clean workspace on the next sweep.
 	if o.isReclaim(current, session) {
-		// Завершённую сессию убивать нечего: карточка вернулась в готовые уже
-		// после её конца — значит человек переоткрыл задачу и ждёт, что её
-		// возьмут заново. Молча уходим, и следующий обход intake её подберёт.
-		// Без этого синк на каждом тике возвращал карточку в Done по факту
-		// смёрженного PR, а встроенная автоматизация доски закрывала issue —
-		// вернуть задачу в работу руками было невозможно.
+		// A terminated session has nothing to kill: the card moved back to
+		// ready after the work ended, so a human reopened the task and expects
+		// it picked up again. Leave the card alone and let the next intake
+		// sweep claim it. Without this the sync kept rewriting the card to Done
+		// (its PR is merged) on every tick, and the board built-in automation
+		// closed the issue again — returning a task to work by hand was
+		// impossible.
 		if session.IsTerminated {
 			o.logger.Info("project sync: card is back in the ready column, leaving it to intake",
 				"session", session.ID, "issue", issueID, "status", current)

@@ -207,6 +207,26 @@ func TestTerminatedSessionOnReadyCardIsNotKilled(t *testing.T) {
 	}
 }
 
+func TestReopenedTaskOnReadyCardIsNotPushedBackToDone(t *testing.T) {
+	created := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	now := created.Add(10 * time.Minute)
+	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "Ready"}}
+	sess := session(created)
+	sess.IsTerminated = true
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{boardProject()},
+		sessions: []domain.SessionRecord{sess},
+		prs:      map[domain.SessionID][]domain.PullRequest{"vibeli-1": {{Number: 76, Merged: true}}},
+	}
+
+	if err := newObserver(board, store, &fakeKiller{}, now).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(board.writes) != 0 {
+		t.Fatalf("a reopened card must stay in the ready column, got %#v", board.writes)
+	}
+}
+
 func TestProjectsWithoutBoardIntakeAreIgnored(t *testing.T) {
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
 	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "Ready"}}
