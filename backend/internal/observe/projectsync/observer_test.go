@@ -179,7 +179,19 @@ func TestCardDraggedBackToReadyKillsTheSession(t *testing.T) {
 	store := &fakeStore{projects: []domain.ProjectRecord{boardProject()}, sessions: []domain.SessionRecord{session(created)}}
 	killer := &fakeKiller{}
 
-	if err := newObserver(board, store, killer, now).Poll(context.Background()); err != nil {
+	observer := New(fakeResolver{board}, store, killer, Config{
+		Clock:  func() time.Time { return now },
+		Logger: discardLogger(),
+	})
+	// The first sweep is the one that stamps the session as seen; the human
+	// drag is only distinguishable from "not moved yet" on a later sweep.
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	board.status["github:acme/demo#74"] = "Ready"
+	board.writes = nil
+	now = now.Add(10 * time.Minute)
+	if err := observer.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(killer.killed) != 1 || killer.killed[0] != "vibeli-1" {
@@ -253,6 +265,28 @@ func TestSecondAttemptOwnsTheCardInsteadOfTheMergedOne(t *testing.T) {
 	}
 	if len(board.writes) != 0 {
 		t.Fatalf("the merged attempt must not drag the card to Done: %#v", board.writes)
+	}
+}
+
+func TestSweepThatFallsBehindDoesNotKillAFreshSession(t *testing.T) {
+	created := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	// The session is already older than the grace window when this loop first
+	// gets to it — a rate-limited board makes one sweep take minutes. Its card
+	// still reads "Ready" because nothing has moved it yet, which must not be
+	// mistaken for a human taking the work back.
+	now := created.Add(30 * time.Minute)
+	board := &fakeBoard{status: map[domain.IssueID]string{"github:acme/demo#74": "Ready"}}
+	store := &fakeStore{projects: []domain.ProjectRecord{boardProject()}, sessions: []domain.SessionRecord{session(created)}}
+	killer := &fakeKiller{}
+
+	if err := newObserver(board, store, killer, now).Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(killer.killed) != 0 {
+		t.Fatalf("killed = %v, want none: the card was never moved off Ready", killer.killed)
+	}
+	if len(board.writes) != 1 || board.writes[0].status != "In progress" {
+		t.Fatalf("writes = %#v, want the card moved to In progress", board.writes)
 	}
 }
 

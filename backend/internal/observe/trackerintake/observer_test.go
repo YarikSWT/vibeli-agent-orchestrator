@@ -3,6 +3,7 @@ package trackerintake
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -106,6 +107,90 @@ func TestPollRespawnsIssueAfterTerminatedSession(t *testing.T) {
 	}
 	if len(spawner.calls) != 1 || spawner.calls[0].IssueID != "github:acme/demo#12" {
 		t.Fatalf("spawn calls = %+v, want one spawn for issue #12 (terminated session should not block respawn)", spawner.calls)
+	}
+}
+
+func TestIssueIsQuarantinedAfterRepeatedFailedAttempts(t *testing.T) {
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	attempts := make([]domain.SessionRecord, 0, quarantineAttempts)
+	for i := range quarantineAttempts {
+		attempts = append(attempts, domain.SessionRecord{
+			ID:           domain.SessionID(fmt.Sprintf("demo-%d", i+1)),
+			ProjectID:    "demo",
+			IssueID:      "github:acme/demo#12",
+			IsTerminated: true,
+			CreatedAt:    now.Add(-time.Duration(i+1) * time.Minute),
+		})
+	}
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "demo",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config:        domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{Enabled: true, Assignee: "alice"}},
+		}},
+		sessions: attempts,
+	}
+	tracker := &fakeTracker{issues: []domain.Issue{{
+		ID:        domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12"},
+		Title:     "A card whose sessions keep dying",
+		State:     domain.IssueOpen,
+		Assignees: []string{"alice"},
+	}}}
+	spawner := &fakeSpawner{}
+
+	observer := New(singleResolver(tracker), store, spawner, Config{
+		Clock:  func() time.Time { return now },
+		Logger: discardLogger(),
+	})
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawn calls = %+v, want none: three attempts died without a PR", spawner.calls)
+	}
+}
+
+func TestAttemptThatOpenedAPRDoesNotCountTowardsQuarantine(t *testing.T) {
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	sessions := make([]domain.SessionRecord, 0, quarantineAttempts)
+	prs := map[domain.SessionID][]domain.PullRequest{}
+	for i := range quarantineAttempts {
+		id := domain.SessionID(fmt.Sprintf("demo-%d", i+1))
+		sessions = append(sessions, domain.SessionRecord{
+			ID:           id,
+			ProjectID:    "demo",
+			IssueID:      "github:acme/demo#12",
+			IsTerminated: true,
+			CreatedAt:    now.Add(-time.Duration(i+1) * time.Minute),
+		})
+		prs[id] = []domain.PullRequest{{Number: 100 + i, Merged: true}}
+	}
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "demo",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config:        domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{Enabled: true, Assignee: "alice"}},
+		}},
+		sessions: sessions,
+		prs:      prs,
+	}
+	tracker := &fakeTracker{issues: []domain.Issue{{
+		ID:        domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12"},
+		Title:     "Reopened after each attempt shipped a PR",
+		State:     domain.IssueOpen,
+		Assignees: []string{"alice"},
+	}}}
+	spawner := &fakeSpawner{}
+
+	observer := New(singleResolver(tracker), store, spawner, Config{
+		Clock:  func() time.Time { return now },
+		Logger: discardLogger(),
+	})
+	if err := observer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(spawner.calls) != 1 {
+		t.Fatalf("spawn calls = %+v, want one: attempts that shipped a PR are not failures", spawner.calls)
 	}
 }
 

@@ -41,6 +41,13 @@ const (
 	// maxItemPages guards against a pathological cursor cycle: 100 pages at the
 	// max page size covers a 10k-card board before failing loud.
 	maxItemPages = 100
+	// defaultCardTTL is how long one board read serves every caller. Reading a
+	// card used to page the whole board per call, so a sync loop over N sessions
+	// cost N board reads a minute: on a board with a hundred sessions that
+	// exhausted the GraphQL quota outright and stretched one sweep past the
+	// window in which a fresh session is supposed to move its card. The TTL is
+	// shorter than the sync tick, so each sweep still starts from a fresh board.
+	defaultCardTTL = 30 * time.Second
 )
 
 // Sentinel errors callers match with errors.Is rather than parsing GraphQL
@@ -73,6 +80,13 @@ type Options struct {
 	// delegates to the repository-level tracker.
 	Issues ports.Tracker
 
+	// CardCacheTTL is how long one board read is reused. Zero means
+	// defaultCardTTL; a negative value disables the cache (tests that assert on
+	// request counts).
+	CardCacheTTL time.Duration
+	// Clock is the time source for the card cache. Nil means time.Now.
+	Clock func() time.Time
+
 	HTTPClient *http.Client
 	GraphQLURL string
 	UserAgent  string
@@ -95,6 +109,13 @@ type Tracker struct {
 	itemMu    sync.Mutex
 	itemByID  map[string]string
 	statusRef *statusFieldRef
+
+	// cardMu guards the board snapshot shared by List, Status and SetStatus.
+	cardMu    sync.Mutex
+	cards     []card
+	cardsAt   time.Time
+	cardTTL   time.Duration
+	now       func() time.Time
 }
 
 // statusFieldRef caches the board's Status field id and its option ids. Both are
@@ -124,6 +145,14 @@ func New(opts Options) (*Tracker, error) {
 		statusField: strings.TrimSpace(opts.StatusField),
 		issues:      opts.Issues,
 		itemByID:    map[string]string{},
+		cardTTL:     opts.CardCacheTTL,
+		now:         opts.Clock,
+	}
+	if t.cardTTL == 0 {
+		t.cardTTL = defaultCardTTL
+	}
+	if t.now == nil {
+		t.now = time.Now
 	}
 	if t.http == nil {
 		t.http = &http.Client{Timeout: 30 * time.Second}
@@ -174,7 +203,7 @@ func (t *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter doma
 	if repo.Native != "" && repo.Provider != domain.TrackerProviderGitHub && repo.Provider != domain.TrackerProviderGitHubProjects {
 		return nil, fmt.Errorf("%w: provider=%q", ErrWrongProvider, repo.Provider)
 	}
-	cards, err := t.listCards(ctx)
+	cards, err := t.cachedCards(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +230,7 @@ func (t *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter doma
 // Status returns the board column an issue currently sits in. ErrNotFound means
 // the issue has no card on this board.
 func (t *Tracker) Status(ctx context.Context, id domain.IssueID) (string, error) {
-	cards, err := t.listCards(ctx)
+	cards, err := t.cachedCards(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -260,12 +289,16 @@ func (t *Tracker) SetStatus(ctx context.Context, id domain.IssueID, status strin
 			} `json:"projectV2Item"`
 		} `json:"updateProjectV2ItemFieldValue"`
 	}
-	return t.do(ctx, mutation, map[string]any{
+	if err := t.do(ctx, mutation, map[string]any{
 		"project": t.projectID,
 		"item":    itemID,
 		"field":   ref.fieldID,
 		"option":  optionID,
-	}, &resp)
+	}, &resp); err != nil {
+		return err
+	}
+	t.noteStatus(id, want)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +387,54 @@ type itemsResponse struct {
 //
 // Cards whose content is not an issue (draft notes, pull requests) are skipped:
 // AO has nothing to spawn for them.
+// cachedCards serves the board snapshot every read goes through. One read per
+// TTL is enough: the board is polled on a timer, and a sweep that asks about a
+// hundred sessions wants one snapshot, not a hundred identical board reads.
+func (t *Tracker) cachedCards(ctx context.Context) ([]card, error) {
+	if t.cardTTL < 0 {
+		return t.listCards(ctx)
+	}
+	t.cardMu.Lock()
+	if t.cards != nil && t.now().Sub(t.cardsAt) < t.cardTTL {
+		cards := t.cards
+		t.cardMu.Unlock()
+		return cards, nil
+	}
+	t.cardMu.Unlock()
+
+	// The read happens outside the lock: it is a network call, and holding the
+	// mutex across it would serialize every caller behind the slowest one. Two
+	// callers racing here cost one extra board read, which the TTL then absorbs.
+	cards, err := t.listCards(ctx)
+	if err != nil {
+		return nil, err
+	}
+	t.cardMu.Lock()
+	t.cards, t.cardsAt = cards, t.now()
+	t.cardMu.Unlock()
+	return cards, nil
+}
+
+// noteStatus records a status this tracker just wrote, so the cached snapshot
+// does not report the pre-write column for the rest of its TTL and make the
+// caller write it again.
+func (t *Tracker) noteStatus(id domain.IssueID, status string) {
+	want := issueKey(id)
+	t.cardMu.Lock()
+	defer t.cardMu.Unlock()
+	for i := range t.cards {
+		if issueKey(t.cards[i].issueID) == want {
+			// The slice is handed out by cachedCards, so it is copied before the
+			// edit: a reader holding the old snapshot must not see it mutate.
+			updated := make([]card, len(t.cards))
+			copy(updated, t.cards)
+			updated[i].status = status
+			t.cards = updated
+			return
+		}
+	}
+}
+
 func (t *Tracker) listCards(ctx context.Context) ([]card, error) {
 	query := fmt.Sprintf(itemsQuery, itemPageSize)
 	var (

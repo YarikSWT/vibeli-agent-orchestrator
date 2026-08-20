@@ -18,6 +18,12 @@ import (
 )
 
 const (
+	// quarantineWindow and quarantineAttempts bound the failure-loop guard: this
+	// many sessions that ended without a PR inside this window take the card out
+	// of intake until a human looks at it.
+	quarantineWindow   = time.Hour
+	quarantineAttempts = 3
+
 	// DefaultTickInterval is intentionally slower than runtime liveness checks:
 	// intake is a backlog sweep, not an interactive status surface.
 	DefaultTickInterval = time.Minute
@@ -118,13 +124,16 @@ type Observer struct {
 	clock          func() time.Time
 	logger         *slog.Logger
 	backoffUntil   map[string]time.Time
-	gate           *Gate
+	// quarantined remembers issues intake stopped claiming, so the chat hears
+	// about each one once instead of on every tick.
+	quarantined map[domain.IssueID]bool
+	gate        *Gate
 	announcer      Announcer
 }
 
 // New constructs an Observer with safe defaults.
 func New(resolver TrackerResolver, store Store, spawner Spawner, cfg Config) *Observer {
-	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, backoffUntil: map[string]time.Time{}, gate: cfg.Gate, announcer: cfg.Announcer}
+	o := &Observer{resolver: resolver, store: store, spawner: spawner, tick: cfg.Tick, failureBackoff: cfg.FailureBackoff, clock: cfg.Clock, logger: cfg.Logger, backoffUntil: map[string]time.Time{}, quarantined: map[domain.IssueID]bool{}, gate: cfg.Gate, announcer: cfg.Announcer}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -181,6 +190,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	}
 	seen := seenIssueIDs(sessions)
 	live := o.liveIntakeSessions(ctx, sessions)
+	o.quarantineFailedIssues(ctx, sessions, now)
 	for _, project := range enabledProjects {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -256,6 +266,9 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		}
 		issueID := CanonicalIssueID(issue.ID)
 		if issueID == "" || seen[issueID] {
+			continue
+		}
+		if o.quarantined[issueID] {
 			continue
 		}
 		session, _, _, err := o.spawner.Spawn(ctx, ports.SpawnConfig{
@@ -345,6 +358,59 @@ func containsFold(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// quarantineFailedIssues stops intake from re-claiming a card whose sessions
+// keep dying before they produce anything.
+//
+// A card is claimed, its session ends without ever opening a PR, the card is
+// still sitting in the ready column, so intake claims it again — a loop that
+// burns an agent run a minute and is invisible until someone counts the
+// sessions. Three abandoned attempts inside the window is the signal that the
+// task is not going to succeed by itself; the card is left alone and the chat
+// is told once, so a human decides what to do with it.
+//
+// An attempt that opened a PR does not count: that session did its job, and the
+// usual reopen-the-issue flow must keep working.
+func (o *Observer) quarantineFailedIssues(ctx context.Context, sessions []domain.SessionRecord, now time.Time) {
+	attempts := map[domain.IssueID]int{}
+	titles := map[domain.IssueID]string{}
+	for _, sess := range sessions {
+		if sess.IssueID == "" || !sess.IsTerminated {
+			continue
+		}
+		if now.Sub(sess.CreatedAt.UTC()) > quarantineWindow {
+			continue
+		}
+		prs, err := o.store.ListPRsBySession(ctx, sess.ID)
+		if err != nil {
+			o.logger.Warn("tracker intake: read session PRs failed", "session", sess.ID, "err", err)
+			continue
+		}
+		if len(prs) > 0 {
+			continue
+		}
+		attempts[sess.IssueID]++
+		titles[sess.IssueID] = string(sess.ID)
+	}
+	for issueID, count := range attempts {
+		if count < quarantineAttempts || o.quarantined[issueID] {
+			continue
+		}
+		o.quarantined[issueID] = true
+		o.logger.Warn("tracker intake: issue quarantined after repeated failed attempts",
+			"issue", issueID, "attempts", count, "window", quarantineWindow, "last", titles[issueID])
+		if o.announcer != nil {
+			o.announcer.Announce(fmt.Sprintf("⛔️ %s снята с конвейера: %d сессии подряд закончились без PR. Карточку разбирает человек — конвейер её больше не берёт.", issueID, count))
+		}
+	}
+	// A card that stopped failing (its sessions now open PRs, or the old
+	// attempts aged out of the window) becomes claimable again on its own.
+	for issueID := range o.quarantined {
+		if attempts[issueID] < quarantineAttempts {
+			delete(o.quarantined, issueID)
+		}
+	}
 }
 
 func seenIssueIDs(sessions []domain.SessionRecord) map[domain.IssueID]bool {

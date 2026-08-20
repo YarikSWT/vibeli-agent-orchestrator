@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	trackergithub "github.com/aoagents/agent-orchestrator/backend/internal/adapters/tracker/github"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -184,6 +185,38 @@ func TestStatusReportsCurrentColumn(t *testing.T) {
 
 	if _, err := tracker.Status(context.Background(), "github:acme/demo#404"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown issue error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBoardIsReadOncePerTTL(t *testing.T) {
+	board := &fakeBoard{}
+	tracker := newTestTracker(t, board)
+
+	for range 5 {
+		if _, err := tracker.Status(context.Background(), "github:acme/demo#75"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if board.calls != 1 {
+		t.Fatalf("board reads = %d, want 1: a sweep over many sessions must not page the board per session", board.calls)
+	}
+}
+
+func TestBoardIsReReadAfterTTL(t *testing.T) {
+	board := &fakeBoard{}
+	tracker := newTestTracker(t, board)
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	tracker.now = func() time.Time { return now }
+
+	if _, err := tracker.Status(context.Background(), "github:acme/demo#75"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(defaultCardTTL + time.Second)
+	if _, err := tracker.Status(context.Background(), "github:acme/demo#75"); err != nil {
+		t.Fatal(err)
+	}
+	if board.calls != 2 {
+		t.Fatalf("board reads = %d, want 2: a stale snapshot must be refreshed", board.calls)
 	}
 }
 

@@ -96,6 +96,13 @@ type Observer struct {
 	// warnedMissing remembers columns the board does not have, so a board
 	// without "In review" logs once instead of on every tick.
 	warnedMissing map[string]bool
+	// firstSeen records when this loop first laid eyes on a session. The reclaim
+	// grace runs from that moment, not from the session's birth: a sweep that
+	// falls behind (a rate-limited board, a hundred sessions) would otherwise
+	// meet a brand-new session whose card it has not moved yet, read the card as
+	// still "Ready", and kill the session as reclaimed — which intake answers by
+	// claiming the same card again, forever.
+	firstSeen map[domain.SessionID]time.Time
 }
 
 // New constructs an Observer with safe defaults.
@@ -111,6 +118,7 @@ func New(resolver BoardResolver, store Store, killer Killer, cfg Config) *Observ
 		logger:        cfg.Logger,
 		lastWritten:   map[domain.IssueID]string{},
 		warnedMissing: map[string]bool{},
+		firstSeen:     map[domain.SessionID]time.Time{},
 	}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
@@ -169,6 +177,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	o.noteSeen(sessions)
 	for _, session := range currentSessions(sessions) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -302,7 +311,29 @@ func (o *Observer) isReclaim(current string, session domain.SessionRecord) bool 
 	if session.IsTerminated {
 		return true
 	}
-	return o.clock().UTC().Sub(session.CreatedAt.UTC()) >= o.reclaimGrace
+	seen, ok := o.firstSeen[session.ID]
+	if !ok {
+		return false
+	}
+	return o.clock().UTC().Sub(seen.UTC()) >= o.reclaimGrace
+}
+
+// noteSeen stamps the first sweep that saw a session and forgets sessions that
+// are gone, so the map tracks the store rather than growing with it.
+func (o *Observer) noteSeen(sessions []domain.SessionRecord) {
+	now := o.clock().UTC()
+	alive := make(map[domain.SessionID]bool, len(sessions))
+	for _, session := range sessions {
+		alive[session.ID] = true
+		if _, ok := o.firstSeen[session.ID]; !ok {
+			o.firstSeen[session.ID] = now
+		}
+	}
+	for id := range o.firstSeen {
+		if !alive[id] {
+			delete(o.firstSeen, id)
+		}
+	}
 }
 
 // desiredStatus maps session + PR facts onto a board column. An empty result
